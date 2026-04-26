@@ -21,7 +21,9 @@ from wenku_to_pdf import (
     page_image_ready,
     page_index_from_font_url,
     page_index_from_resource_url,
+    structured_page_needs_image,
     structured_page_needs_font,
+    structured_page_resource_needs,
     url_with_query_params,
 )
 
@@ -111,11 +113,18 @@ class StructuredPageFontRequirementTest(unittest.TestCase):
         page_data = {"body": [{"t": "pic", "c": {"ix": 0, "iy": 0, "iw": 959, "ih": 1356}}]}
 
         self.assertFalse(structured_page_needs_font(page_data))
+        self.assertTrue(structured_page_needs_image(page_data))
 
     def test_word_page_needs_font_resource(self):
         page_data = {"body": [{"t": "word", "c": "hello"}]}
 
         self.assertTrue(structured_page_needs_font(page_data))
+        self.assertFalse(structured_page_needs_image(page_data))
+
+    def test_mixed_page_requires_image_and_font(self):
+        page_data = {"body": [{"t": "pic", "c": {}}, {"t": "word", "c": "hello"}]}
+
+        self.assertEqual(structured_page_resource_needs(page_data), {"image": True, "font": True})
 
 
 class PdfFallbackTest(unittest.TestCase):

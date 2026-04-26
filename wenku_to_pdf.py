@@ -437,6 +437,20 @@ def structured_page_needs_font(page_data):
     return False
 
 
+def structured_page_needs_image(page_data):
+    for item in page_data.get("body") or []:
+        if item.get("t") == "pic":
+            return True
+    return False
+
+
+def structured_page_resource_needs(page_data):
+    return {
+        "image": structured_page_needs_image(page_data),
+        "font": structured_page_needs_font(page_data),
+    }
+
+
 def decode_response_text(raw, content_type=""):
     charset_match = re.search(r"charset=([^\s;]+)", content_type or "", flags=re.I)
     encodings = []
@@ -528,11 +542,26 @@ async def wait_for_pending_response_tasks(pending_response_tasks):
         await asyncio.gather(*list(pending_response_tasks), return_exceptions=True)
 
 
-async def collect_structured_resources(page, page_count, json_urls, png_urls, font_urls, pending_response_tasks, progress=None):
+async def collect_structured_resources(
+    page,
+    page_count,
+    json_urls,
+    png_urls,
+    font_urls,
+    pending_response_tasks,
+    progress=None,
+    required_png_pages=None,
+    required_font_pages=None,
+):
+    required_png_pages = set(required_png_pages or [])
+    required_font_pages = set(required_font_pages or [])
     await click_read_more(page, max_clicks=8)
     for round_index in range(1, 12):
         await wait_for_pending_response_tasks(pending_response_tasks)
-        if len(json_urls) >= page_count and len(png_urls) >= page_count:
+        has_json = all(index in json_urls for index in range(1, page_count + 1))
+        has_png = all(index in png_urls for index in required_png_pages)
+        has_font = all(index in font_urls for index in required_font_pages)
+        if has_json and has_png and has_font:
             break
         await scroll_to_load(page, rounds=10, pixels=2000, delay_ms=240)
         await page.wait_for_timeout(900)
@@ -610,21 +639,53 @@ async def process_structured_document(context, page, page_count, temp_dir, outpu
     await wait_for_pending_response_tasks(pending_response_tasks)
 
     missing_json = [index for index in range(1, page_count + 1) if index not in json_urls]
-    missing_png = [index for index in range(1, page_count + 1) if index not in png_urls]
-    if missing_json or missing_png:
-        raise StructuredResourceNotUsable(f"结构化资源不完整，缺少页面：{(missing_json or missing_png)[:10]}")
+    if missing_json:
+        raise StructuredResourceNotUsable(f"结构化资源不完整，缺少页面：{missing_json[:10]}")
 
     use_default_font = file_type in {"excel", "xls", "xlsx"}
     default_font = "STSong-Light" if use_default_font else None
     emit_progress(progress, f"页面资源准备完成，共 {page_count} 页")
 
+    required_png_pages = set()
+    required_font_pages = set()
     for index in range(1, page_count + 1):
         raw_json = await download_text(context, json_urls[index], page.url)
         page_json = json_callback_body(raw_json)
         (temp_dir / f"{index}.json").write_text(page_json, encoding="utf-8")
-        (temp_dir / f"{index}.png").write_bytes(await download_bytes(context, png_urls[index], page.url))
         page_data = json.loads(page_json)
-        if not use_default_font and structured_page_needs_font(page_data):
+        needs = structured_page_resource_needs(page_data)
+        if needs["image"]:
+            required_png_pages.add(index)
+        if needs["font"] and not use_default_font:
+            required_font_pages.add(index)
+
+    missing_png = [index for index in sorted(required_png_pages) if index not in png_urls]
+    missing_font = [index for index in sorted(required_font_pages) if index not in font_urls]
+    if missing_png or missing_font:
+        await collect_structured_resources(
+            page,
+            page_count,
+            json_urls,
+            png_urls,
+            font_urls,
+            pending_response_tasks,
+            progress=progress,
+            required_png_pages=required_png_pages,
+            required_font_pages=required_font_pages,
+        )
+        await wait_for_pending_response_tasks(pending_response_tasks)
+        missing_png = [index for index in sorted(required_png_pages) if index not in png_urls]
+        missing_font = [index for index in sorted(required_font_pages) if index not in font_urls]
+
+    if missing_png:
+        raise StructuredResourceNotUsable(f"结构化图片资源不完整，缺少页面：{missing_png[:10]}")
+    if missing_font:
+        raise StructuredResourceNotUsable(f"结构化字体资源不完整，缺少页面：{missing_font[:10]}")
+
+    for index in range(1, page_count + 1):
+        if index in required_png_pages:
+            (temp_dir / f"{index}.png").write_bytes(await download_bytes(context, png_urls[index], page.url))
+        if index in required_font_pages:
             if index not in font_urls:
                 raise StructuredResourceNotUsable(f"第 {index} 页缺少字体资源")
             font_css = await download_text(context, font_urls[index], page.url)
