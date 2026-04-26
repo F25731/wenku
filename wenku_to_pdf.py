@@ -511,11 +511,8 @@ def merge_page_pdfs(page_pdfs, output_pdf):
         merger.close()
 
 
-async def process_structured_document(context, page, page_count, temp_dir, output_pdf, data, file_type, progress=None):
-    if not page_count:
-        raise StructuredResourceNotUsable("缺少页数，无法进行结构化处理")
-
-    doc_id = doc_id_from_data_or_url(data, page.url)
+async def process_structured_document(context, page, page_count, temp_dir, output_pdf, data, file_type, progress=None, source_url=None):
+    doc_id = doc_id_from_data_or_url(data, source_url or page.url)
     if not doc_id:
         raise StructuredResourceNotUsable("缺少文档 ID，无法进行结构化处理")
 
@@ -548,6 +545,26 @@ async def process_structured_document(context, page, page_count, temp_dir, outpu
         task.add_done_callback(pending_response_tasks.discard)
 
     page.on("response", on_response)
+
+    if source_url:
+        structured_url = url_with_query_params(source_url, edtMode=2)
+        await page.goto(structured_url, wait_until="domcontentloaded", timeout=60000)
+        await safe_wait(page)
+        loaded_data = extract_page_data(await page.content())
+        if loaded_data:
+            data = loaded_data
+            _, _, loaded_file_type, _, loaded_page_count = reader_info(data)
+            file_type = loaded_file_type or file_type
+            page_count = loaded_page_count or page_count
+            doc_id = doc_id_from_data_or_url(data, source_url) or doc_id
+            initial_json, initial_png, initial_font = initial_structured_resource_urls(data, doc_id)
+            json_urls.update(initial_json)
+            png_urls.update(initial_png)
+            font_urls.update(initial_font)
+
+    if not page_count:
+        raise StructuredResourceNotUsable("缺少页数，无法进行结构化处理")
+
     emit_progress(progress, "正在准备文档资源")
     await collect_structured_resources(page, page_count, json_urls, png_urls, font_urls, pending_response_tasks, progress=progress)
     await wait_for_pending_response_tasks(pending_response_tasks)
@@ -1087,17 +1104,16 @@ async def convert(url, cookie_text, output_dir, temp_root=None, keep_temp=False,
             elif file_type == "pdf":
                 emit_progress(progress, "已选择最佳处理方案")
                 try:
-                    structured_data = await load_structured_page_data(page, url, data)
-                    _, _, structured_file_type, _, structured_page_count = reader_info(structured_data)
                     result = await process_structured_document(
                         browser_context,
                         page,
-                        structured_page_count or page_count,
+                        page_count,
                         temp_dir,
                         output_pdf,
-                        structured_data,
-                        structured_file_type or file_type,
+                        data,
+                        file_type,
                         progress=progress,
+                        source_url=url,
                     )
                 except StructuredResourceNotUsable:
                     emit_progress(progress, "正在切换备用处理方案")
@@ -1120,17 +1136,16 @@ async def convert(url, cookie_text, output_dir, temp_root=None, keep_temp=False,
             elif file_type in {"excel", "xls", "xlsx"}:
                 emit_progress(progress, "已选择最佳处理方案")
                 try:
-                    structured_data = await load_structured_page_data(page, url, data)
-                    _, _, structured_file_type, _, structured_page_count = reader_info(structured_data)
                     result = await process_structured_document(
                         browser_context,
                         page,
-                        structured_page_count or page_count,
+                        page_count,
                         temp_dir,
                         output_pdf,
-                        structured_data,
-                        structured_file_type or file_type,
+                        data,
+                        file_type,
                         progress=progress,
+                        source_url=url,
                     )
                 except StructuredResourceNotUsable:
                     emit_progress(progress, "正在切换备用处理方案")
@@ -1153,17 +1168,16 @@ async def convert(url, cookie_text, output_dir, temp_root=None, keep_temp=False,
             elif file_type in {"word", "doc", "docx"}:
                 emit_progress(progress, "已选择最佳处理方案")
                 try:
-                    structured_data = await load_structured_page_data(page, url, data)
-                    _, _, structured_file_type, _, structured_page_count = reader_info(structured_data)
                     result = await process_structured_document(
                         browser_context,
                         page,
-                        structured_page_count or page_count,
+                        page_count,
                         temp_dir,
                         output_pdf,
-                        structured_data,
-                        structured_file_type or file_type,
+                        data,
+                        file_type,
                         progress=progress,
+                        source_url=url,
                     )
                 except StructuredResourceNotUsable:
                     emit_progress(progress, "正在切换备用处理方案")
