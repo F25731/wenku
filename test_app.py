@@ -109,7 +109,13 @@ class WorkerBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         class RetryRuntime(app.WorkerBrowserRuntime):
             def __init__(self):
-                super().__init__(worker_id=1, restart_after_jobs=20, job_timeout_seconds=1, retry_count=1)
+                super().__init__(
+                    worker_id=1,
+                    restart_after_jobs=20,
+                    startup_attempt_timeout_seconds=1,
+                    startup_total_timeout_seconds=2,
+                    retry_count=1,
+                )
                 self.restart_count = 0
 
             async def ensure_browser(self):
@@ -130,7 +136,7 @@ class WorkerBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             app.convert_with_browser = old_convert_with_browser
             runtime.loop.close()
 
-    async def test_convert_timeout_restarts_browser(self):
+    async def test_startup_timeout_restarts_browser_and_retries(self):
         old_convert_with_browser = app.convert_with_browser
 
         async def slow_convert(**kwargs):
@@ -138,21 +144,58 @@ class WorkerBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         class TimeoutRuntime(app.WorkerBrowserRuntime):
             def __init__(self):
-                super().__init__(worker_id=1, restart_after_jobs=20, job_timeout_seconds=0.01)
-                self.restarted = False
+                super().__init__(
+                    worker_id=1,
+                    restart_after_jobs=20,
+                    startup_attempt_timeout_seconds=0.01,
+                    startup_total_timeout_seconds=0.02,
+                    retry_count=1,
+                )
+                self.restart_count = 0
 
             async def ensure_browser(self):
                 return object()
 
             async def restart_browser(self):
-                self.restarted = True
+                self.restart_count += 1
 
         app.convert_with_browser = slow_convert
         runtime = TimeoutRuntime()
         try:
             with self.assertRaises(TimeoutError):
                 await runtime.convert(url="u", cookie_text="c", output_dir="out")
-            self.assertTrue(runtime.restarted)
+            self.assertEqual(runtime.restart_count, 2)
+        finally:
+            app.convert_with_browser = old_convert_with_browser
+            runtime.loop.close()
+
+    async def test_startup_timeout_stops_after_document_info_is_ready(self):
+        old_convert_with_browser = app.convert_with_browser
+
+        async def slow_after_document_ready(**kwargs):
+            kwargs["progress"]("文档名称：demo")
+            await asyncio.sleep(0.05)
+            return {"output": "ok.pdf", "pages": 1}
+
+        class StartupOnlyRuntime(app.WorkerBrowserRuntime):
+            def __init__(self):
+                super().__init__(
+                    worker_id=1,
+                    restart_after_jobs=20,
+                    startup_attempt_timeout_seconds=0.01,
+                    startup_total_timeout_seconds=0.01,
+                    retry_count=0,
+                )
+
+            async def ensure_browser(self):
+                return object()
+
+        app.convert_with_browser = slow_after_document_ready
+        runtime = StartupOnlyRuntime()
+        try:
+            result = await runtime.convert(url="u", cookie_text="c", output_dir="out")
+
+            self.assertEqual(result["output"], "ok.pdf")
         finally:
             app.convert_with_browser = old_convert_with_browser
             runtime.loop.close()

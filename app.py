@@ -34,7 +34,8 @@ MAX_QUEUE_WORKERS = 2
 DOWNLOAD_TTL_SECONDS = int(os.environ.get("WENKU_DOWNLOAD_TTL_SECONDS", "3600"))
 DOWNLOAD_CLEANUP_INTERVAL_SECONDS = int(os.environ.get("WENKU_DOWNLOAD_CLEANUP_INTERVAL_SECONDS", "300"))
 BROWSER_RESTART_AFTER_JOBS = int(os.environ.get("WENKU_BROWSER_RESTART_AFTER_JOBS", "20"))
-JOB_TIMEOUT_SECONDS = float(os.environ.get("WENKU_JOB_TIMEOUT_SECONDS", "900"))
+JOB_STARTUP_ATTEMPT_TIMEOUT_SECONDS = float(os.environ.get("WENKU_JOB_STARTUP_ATTEMPT_TIMEOUT_SECONDS", "300"))
+JOB_STARTUP_TOTAL_TIMEOUT_SECONDS = float(os.environ.get("WENKU_JOB_STARTUP_TOTAL_TIMEOUT_SECONDS", "600"))
 JOB_RETRY_COUNT = int(os.environ.get("WENKU_JOB_RETRY_COUNT", "1"))
 COOKIE_TEST_URL = os.environ.get("WENKU_COOKIE_TEST_URL", "https://wenku.baidu.com/")
 CORS_ORIGINS = [
@@ -665,15 +666,37 @@ def get_job_snapshot(job_id):
 
 
 class WorkerBrowserRuntime:
-    def __init__(self, worker_id, restart_after_jobs, job_timeout_seconds=JOB_TIMEOUT_SECONDS, retry_count=JOB_RETRY_COUNT):
+    def __init__(
+        self,
+        worker_id,
+        restart_after_jobs,
+        startup_attempt_timeout_seconds=JOB_STARTUP_ATTEMPT_TIMEOUT_SECONDS,
+        startup_total_timeout_seconds=JOB_STARTUP_TOTAL_TIMEOUT_SECONDS,
+        retry_count=JOB_RETRY_COUNT,
+    ):
         self.worker_id = worker_id
         self.restart_after_jobs = max(1, restart_after_jobs)
-        self.job_timeout_seconds = float(job_timeout_seconds) if job_timeout_seconds else None
+        self.startup_attempt_timeout_seconds = float(startup_attempt_timeout_seconds) if startup_attempt_timeout_seconds else None
+        self.startup_total_timeout_seconds = float(startup_total_timeout_seconds) if startup_total_timeout_seconds else None
         self.retry_count = max(0, int(retry_count))
         self.loop = asyncio.new_event_loop()
         self.playwright = None
         self.browser = None
         self.completed_jobs = 0
+
+    @staticmethod
+    def document_ready_message(message):
+        text = str(message or "")
+        return (
+            text.startswith("文档名称")
+            or text.startswith("文档页数")
+            or text.startswith("已选择最佳处理方案")
+            or text.startswith("正在准备文档资源")
+            or text.startswith("页面资源准备完成")
+            or text.startswith("正在切换备用处理方案")
+            or text.startswith("页面识别完成")
+            or text.startswith("处理第 ")
+        )
 
     async def ensure_browser(self):
         if self.browser and self.browser.is_connected():
@@ -700,31 +723,70 @@ class WorkerBrowserRuntime:
 
     async def convert(self, **kwargs):
         attempts = self.retry_count + 1
-        progress = kwargs.get("progress")
+        original_progress = kwargs.get("progress")
+        first_started_at = time.monotonic()
         for attempt in range(1, attempts + 1):
             browser = await self.ensure_browser()
+            document_ready = asyncio.Event()
+
+            def progress(message):
+                if original_progress:
+                    original_progress(message)
+                if self.document_ready_message(message):
+                    document_ready.set()
+
+            attempt_kwargs = dict(kwargs)
+            attempt_kwargs["progress"] = progress
             try:
-                operation = convert_with_browser(browser=browser, **kwargs)
-                if self.job_timeout_seconds:
-                    result = await asyncio.wait_for(operation, timeout=self.job_timeout_seconds)
+                operation = asyncio.create_task(convert_with_browser(browser=browser, **attempt_kwargs))
+                startup_timeout = self.startup_attempt_timeout_seconds
+                if self.startup_total_timeout_seconds:
+                    remaining = self.startup_total_timeout_seconds - (time.monotonic() - first_started_at)
+                    if remaining <= 0:
+                        raise TimeoutError(f"启动阶段超过 {self.startup_total_timeout_seconds:g} 秒，已自动释放通道")
+                    startup_timeout = min(startup_timeout, remaining) if startup_timeout else remaining
+
+                if startup_timeout:
+                    ready_task = asyncio.create_task(document_ready.wait())
+                    done, _ = await asyncio.wait(
+                        {operation, ready_task},
+                        timeout=startup_timeout,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if not done:
+                        operation.cancel()
+                        ready_task.cancel()
+                        try:
+                            await operation
+                        except asyncio.CancelledError:
+                            pass
+                        raise TimeoutError(f"启动阶段超过 {startup_timeout:g} 秒仍未读取到文档信息")
+                    if ready_task in done:
+                        await ready_task
+                    else:
+                        ready_task.cancel()
+                    if operation in done:
+                        result = await operation
+                    else:
+                        result = await operation
                 else:
                     result = await operation
                 self.completed_jobs += 1
                 if self.completed_jobs >= self.restart_after_jobs:
                     await self.restart_browser()
                 return result
-            except asyncio.TimeoutError as exc:
+            except TimeoutError as exc:
                 await self.restart_browser()
                 if attempt < attempts:
-                    if progress:
-                        progress("处理环境响应超时，已自动重置并重试")
+                    if original_progress:
+                        original_progress("启动阶段响应超时，已自动重置并重试")
                     continue
-                raise TimeoutError(f"任务超过 {self.job_timeout_seconds:g} 秒未完成，已自动释放通道") from exc
+                raise
             except Exception:
                 await self.restart_browser()
                 if attempt < attempts:
-                    if progress:
-                        progress("处理环境已自动重置，正在重试")
+                    if original_progress:
+                        original_progress("处理环境已自动重置，正在重试")
                     continue
                 raise
 
@@ -776,7 +838,13 @@ def run_convert_job(job_id, url, cookie, cookie_slot=None, cookie_total=None, br
 
 
 def queued_convert_worker(worker_id):
-    browser_runtime = WorkerBrowserRuntime(worker_id, BROWSER_RESTART_AFTER_JOBS, JOB_TIMEOUT_SECONDS, JOB_RETRY_COUNT)
+    browser_runtime = WorkerBrowserRuntime(
+        worker_id,
+        BROWSER_RESTART_AFTER_JOBS,
+        JOB_STARTUP_ATTEMPT_TIMEOUT_SECONDS,
+        JOB_STARTUP_TOTAL_TIMEOUT_SECONDS,
+        JOB_RETRY_COUNT,
+    )
     while True:
         job_id, url, override_cookie = job_queue.get()
         has_waiting_marker = False
@@ -851,7 +919,8 @@ def api_status():
         "queued_jobs": queued_job_count(),
         "download_ttl_seconds": DOWNLOAD_TTL_SECONDS,
         "browser_restart_after_jobs": BROWSER_RESTART_AFTER_JOBS,
-        "job_timeout_seconds": JOB_TIMEOUT_SECONDS,
+        "job_startup_attempt_timeout_seconds": JOB_STARTUP_ATTEMPT_TIMEOUT_SECONDS,
+        "job_startup_total_timeout_seconds": JOB_STARTUP_TOTAL_TIMEOUT_SECONDS,
         "job_retry_count": JOB_RETRY_COUNT,
         "download_dir": DOWNLOAD_DIR,
         "token_required": True,
