@@ -284,6 +284,19 @@ def page_image_ready(path, require_nonblank_pages=False):
     return not is_mostly_blank_image(path)
 
 
+def full_page_png_looks_complete(path, min_width=700, min_height=900, min_file_bytes=20000):
+    path = Path(path)
+    if not path.exists() or path.stat().st_size < min_file_bytes:
+        return False
+    try:
+        width, height = image_size(path)
+    except Exception:
+        return False
+    if width < min_width or height < min_height:
+        return False
+    return not is_mostly_blank_image(path)
+
+
 def image_difference_ratio(first_path, second_path):
     with Image.open(first_path).convert("RGB") as first, Image.open(second_path).convert("RGB") as second:
         first.thumbnail((160, 160))
@@ -463,11 +476,10 @@ async def process_pdf_page_images(context, page, page_count, temp_dir, output_pd
         path = temp_dir / f"probe_{url_index:04d}.png"
         try:
             await download_binary(context, url, path, page.url)
-            width, height = image_size(path)
         except Exception:
             path.unlink(missing_ok=True)
             continue
-        if width >= 700 and height >= 900:
+        if full_page_png_looks_complete(path):
             image_items.append((range_start, path))
         else:
             path.unlink(missing_ok=True)

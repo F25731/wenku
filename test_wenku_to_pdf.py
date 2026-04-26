@@ -11,6 +11,7 @@ from wenku_to_pdf import (
     browser_launch_options,
     excel_direct_image_looks_complete,
     excel_page_image_items,
+    full_page_png_looks_complete,
     is_mostly_blank_image,
     page_image_ready,
 )
@@ -78,6 +79,30 @@ class BrowserLaunchOptionsTest(unittest.TestCase):
 class PdfFallbackTest(unittest.TestCase):
     def test_pdf_direct_image_exception_marks_fallback_case(self):
         self.assertTrue(issubclass(PdfDirectImageNotUsable, RuntimeError))
+
+    def test_tiny_placeholder_pdf_png_is_not_treated_as_complete_page(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "placeholder.png"
+            image = Image.new("RGB", (893, 1276), "white")
+            draw = ImageDraw.Draw(image)
+            draw.line((0, 1270, 893, 1270), fill="black", width=4)
+            image.save(path)
+
+            self.assertFalse(full_page_png_looks_complete(path))
+
+    def test_substantial_pdf_png_can_use_direct_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (893, 1276), "white")
+            draw = ImageDraw.Draw(image)
+            for y in range(80, 1180, 36):
+                draw.line((90, y, 780, y), fill="black", width=2)
+                draw.text((100, y + 4), "legal term explanation and notes", fill="black")
+            for x in range(0, 893, 9):
+                draw.point((x, (x * 17) % 1276), fill=(120, 120, 120))
+            image.save(path)
+
+            self.assertTrue(full_page_png_looks_complete(path))
 
 
 class ScreenshotMaskRatioTest(unittest.TestCase):

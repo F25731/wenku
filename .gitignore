@@ -5,6 +5,7 @@ __pycache__/
 
 downloads/
 data/
+debug_probe*/
 tokens.db
 cookies.json
 cookie.txt
