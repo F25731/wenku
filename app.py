@@ -687,16 +687,7 @@ class WorkerBrowserRuntime:
     @staticmethod
     def document_ready_message(message):
         text = str(message or "")
-        return (
-            text.startswith("文档名称")
-            or text.startswith("文档页数")
-            or text.startswith("已选择最佳处理方案")
-            or text.startswith("正在准备文档资源")
-            or text.startswith("页面资源准备完成")
-            or text.startswith("正在切换备用处理方案")
-            or text.startswith("页面识别完成")
-            or text.startswith("处理第 ")
-        )
+        return text.startswith("处理第 ")
 
     async def ensure_browser(self):
         if self.browser and self.browser.is_connected():

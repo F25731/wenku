@@ -97,6 +97,11 @@ class CookiePoolTest(unittest.TestCase):
 
 
 class WorkerBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
+    def test_document_ready_requires_page_processing(self):
+        self.assertFalse(app.WorkerBrowserRuntime.document_ready_message("文档名称：demo"))
+        self.assertFalse(app.WorkerBrowserRuntime.document_ready_message("页面资源准备完成，共 10 页"))
+        self.assertTrue(app.WorkerBrowserRuntime.document_ready_message("处理第 1/10 页 ✅"))
+
     async def test_convert_error_restarts_browser_and_retries_once(self):
         old_convert_with_browser = app.convert_with_browser
         calls = {"count": 0}
@@ -169,11 +174,11 @@ class WorkerBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             app.convert_with_browser = old_convert_with_browser
             runtime.loop.close()
 
-    async def test_startup_timeout_stops_after_document_info_is_ready(self):
+    async def test_startup_timeout_stops_after_page_processing_starts(self):
         old_convert_with_browser = app.convert_with_browser
 
-        async def slow_after_document_ready(**kwargs):
-            kwargs["progress"]("文档名称：demo")
+        async def slow_after_processing_starts(**kwargs):
+            kwargs["progress"]("处理第 1/1 页 ✅")
             await asyncio.sleep(0.05)
             return {"output": "ok.pdf", "pages": 1}
 
@@ -190,7 +195,7 @@ class WorkerBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             async def ensure_browser(self):
                 return object()
 
-        app.convert_with_browser = slow_after_document_ready
+        app.convert_with_browser = slow_after_processing_starts
         runtime = StartupOnlyRuntime()
         try:
             result = await runtime.convert(url="u", cookie_text="c", output_dir="out")
