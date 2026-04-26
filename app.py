@@ -28,6 +28,8 @@ ADMIN_TOKEN_FILE = os.path.join(DATA_DIR, "admin_token.txt")
 MAX_JOB_LOGS = 600
 MAX_COOKIE_POOL_SIZE = 10
 MAX_QUEUE_WORKERS = 2
+DOWNLOAD_TTL_SECONDS = int(os.environ.get("WENKU_DOWNLOAD_TTL_SECONDS", "3600"))
+DOWNLOAD_CLEANUP_INTERVAL_SECONDS = int(os.environ.get("WENKU_DOWNLOAD_CLEANUP_INTERVAL_SECONDS", "300"))
 COOKIE_TEST_URL = os.environ.get("WENKU_COOKIE_TEST_URL", "https://wenku.baidu.com/")
 CORS_ORIGINS = [
     item.strip()
@@ -51,6 +53,7 @@ job_capacity_condition = threading.Condition()
 job_workers_started = False
 active_job_count = 0
 waiting_job_count = 0
+download_cleaner_started = False
 
 
 def format_time(timestamp):
@@ -339,6 +342,49 @@ def remove_waiting_job():
 def queued_job_count():
     with job_capacity_condition:
         return job_queue.qsize() + waiting_job_count
+
+
+def download_file_expired(path, now=None):
+    if DOWNLOAD_TTL_SECONDS <= 0:
+        return False
+    try:
+        modified_at = os.path.getmtime(path)
+    except OSError:
+        return False
+    return (now or time.time()) - modified_at >= DOWNLOAD_TTL_SECONDS
+
+
+def cleanup_expired_downloads():
+    now = time.time()
+    removed = 0
+    if not os.path.isdir(DOWNLOAD_DIR):
+        return removed
+    for name in os.listdir(DOWNLOAD_DIR):
+        path = os.path.join(DOWNLOAD_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        if download_file_expired(path, now):
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def download_cleanup_worker():
+    while True:
+        cleanup_expired_downloads()
+        time.sleep(max(30, DOWNLOAD_CLEANUP_INTERVAL_SECONDS))
+
+
+def start_download_cleaner():
+    global download_cleaner_started
+    if download_cleaner_started:
+        return
+    download_cleaner_started = True
+    thread = threading.Thread(target=download_cleanup_worker, daemon=True)
+    thread.start()
 
 
 def connect_token_db():
@@ -715,6 +761,7 @@ def api_status():
         "concurrency_limit": job_concurrency_limit(),
         "running_jobs": running_jobs,
         "queued_jobs": queued_job_count(),
+        "download_ttl_seconds": DOWNLOAD_TTL_SECONDS,
         "download_dir": DOWNLOAD_DIR,
         "token_required": True,
     })
@@ -941,6 +988,13 @@ def download_file(filename):
     token_ok, token_message, _ = verify_access_token(token, scope=scope)
     if not token_ok:
         return jsonify({"error": token_message}), 403
+    path = os.path.join(DOWNLOAD_DIR, filename)
+    if download_file_expired(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return jsonify({"error": "文件已过期，请重新生成"}), 404
     return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
 
 
@@ -951,6 +1005,7 @@ def open_browser():
 init_token_db()
 get_admin_token()
 start_job_workers()
+start_download_cleaner()
 
 
 if __name__ == "__main__":

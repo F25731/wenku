@@ -92,6 +92,7 @@ class TokenBackendTest(unittest.TestCase):
         self.old_cookie_file = app.COOKIE_FILE
         self.old_cookie_pool_file = app.COOKIE_POOL_FILE
         self.old_download_dir = app.DOWNLOAD_DIR
+        self.old_download_ttl_seconds = app.DOWNLOAD_TTL_SECONDS
         self.old_testing = app.app.config.get("TESTING")
 
         temp_path = Path(self.temp_dir.name)
@@ -100,6 +101,7 @@ class TokenBackendTest(unittest.TestCase):
         app.COOKIE_FILE = str(temp_path / "cookie.txt")
         app.COOKIE_POOL_FILE = str(temp_path / "cookies.json")
         app.DOWNLOAD_DIR = str(temp_path / "downloads")
+        app.DOWNLOAD_TTL_SECONDS = 3600
         Path(app.DOWNLOAD_DIR).mkdir()
         Path(app.ADMIN_TOKEN_FILE).write_text("admin-secret", encoding="utf-8")
         Path(app.COOKIE_FILE).write_text("BAIDUID=a; BDUSS=b", encoding="utf-8")
@@ -112,6 +114,7 @@ class TokenBackendTest(unittest.TestCase):
         app.COOKIE_FILE = self.old_cookie_file
         app.COOKIE_POOL_FILE = self.old_cookie_pool_file
         app.DOWNLOAD_DIR = self.old_download_dir
+        app.DOWNLOAD_TTL_SECONDS = self.old_download_ttl_seconds
         app.app.config["TESTING"] = self.old_testing
         self.temp_dir.cleanup()
 
@@ -296,6 +299,39 @@ class TokenBackendTest(unittest.TestCase):
         self.assertEqual(denied.status_code, 403)
         self.assertEqual(allowed.status_code, 200)
         allowed.close()
+
+    def test_cleanup_expired_downloads_removes_old_files(self):
+        app.DOWNLOAD_TTL_SECONDS = 3600
+        old_file = Path(app.DOWNLOAD_DIR, "old.pdf")
+        fresh_file = Path(app.DOWNLOAD_DIR, "fresh.pdf")
+        old_file.write_bytes(b"old")
+        fresh_file.write_bytes(b"fresh")
+        old_time = 100
+        import time
+        fresh_time = time.time()
+        import os
+        os.utime(old_file, (old_time, old_time))
+        os.utime(fresh_file, (fresh_time, fresh_time))
+
+        removed = app.cleanup_expired_downloads()
+
+        self.assertEqual(removed, 1)
+        self.assertFalse(old_file.exists())
+        self.assertTrue(fresh_file.exists())
+
+    def test_expired_download_is_deleted_on_request(self):
+        app.DOWNLOAD_TTL_SECONDS = 1
+        expired_file = Path(app.DOWNLOAD_DIR, "expired.pdf")
+        expired_file.write_bytes(b"pdf")
+        import os
+        os.utime(expired_file, (100, 100))
+        token = app.create_access_token(1, "download")
+        client = app.app.test_client()
+
+        response = client.get(f"/download/expired.pdf?token={token['token']}")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(expired_file.exists())
 
 
 if __name__ == "__main__":

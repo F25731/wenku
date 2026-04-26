@@ -66,6 +66,12 @@ admin_local.html
 - `cookie.txt`
 - `downloads/`
 
+生成后的 PDF 默认只保留 1 小时。需要调整时修改 `docker-compose.yml`：
+
+```yaml
+WENKU_DOWNLOAD_TTL_SECONDS: "3600"
+```
+
 ## 5. 常用命令
 
 ```bash
