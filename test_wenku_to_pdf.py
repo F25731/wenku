@@ -5,6 +5,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 from wenku_to_pdf import (
+    PdfDirectImageNotUsable,
     READER_OVERLAY_HIDE_CSS,
     TOP_MASK_FIRST_PAGE,
     browser_launch_options,
@@ -72,6 +73,11 @@ class BrowserLaunchOptionsTest(unittest.TestCase):
         self.assertNotIn("channel", options)
         self.assertEqual(options["user_data_dir"], "profile")
         self.assertEqual(options["device_scale_factor"], 2.0)
+
+
+class PdfFallbackTest(unittest.TestCase):
+    def test_pdf_direct_image_exception_marks_fallback_case(self):
+        self.assertTrue(issubclass(PdfDirectImageNotUsable, RuntimeError))
 
 
 class ScreenshotMaskRatioTest(unittest.TestCase):

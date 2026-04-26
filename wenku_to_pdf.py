@@ -422,6 +422,10 @@ async def process_ppt(context, page, page_count, temp_dir, output_pdf, data, pro
     return {"mode": "ppt-page-images", "pages": page_count}
 
 
+class PdfDirectImageNotUsable(RuntimeError):
+    pass
+
+
 async def process_pdf_page_images(context, page, page_count, temp_dir, output_pdf, data, progress=None):
     urls = []
     for _, url in sorted(initial_page_urls_from_data(data).items()):
@@ -469,13 +473,13 @@ async def process_pdf_page_images(context, page, page_count, temp_dir, output_pd
             path.unlink(missing_ok=True)
 
     if page_count and len(image_items) != page_count:
-        raise RuntimeError(f"PDF full-page PNG count is {len(image_items)}, expected {page_count}")
+        raise PdfDirectImageNotUsable(f"PDF full-page PNG count is {len(image_items)}, expected {page_count}")
     if not image_items:
-        raise RuntimeError("No full-page PDF PNG images found")
+        raise PdfDirectImageNotUsable("No full-page PDF PNG images found")
 
     starts = [item[0] for item in image_items]
     if len(starts) != len(set(starts)):
-        raise RuntimeError("PDF full-page PNG ranges contain duplicates")
+        raise PdfDirectImageNotUsable("PDF full-page PNG ranges contain duplicates")
 
     image_items.sort(key=lambda item: item[0])
     emit_progress(progress, f"页面校验完成，共 {len(image_items)} 页")
@@ -864,7 +868,23 @@ async def convert(url, cookie_text, output_dir, temp_root=None, keep_temp=False,
                 result = await process_ppt(browser_context, page, page_count, temp_dir, output_pdf, data, progress=progress)
             elif file_type == "pdf":
                 emit_progress(progress, "已选择最佳处理方案")
-                result = await process_pdf_page_images(browser_context, page, page_count, temp_dir, output_pdf, data, progress=progress)
+                try:
+                    result = await process_pdf_page_images(browser_context, page, page_count, temp_dir, output_pdf, data, progress=progress)
+                except PdfDirectImageNotUsable:
+                    emit_progress(progress, "正在切换备用处理方案")
+                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    await safe_wait(page)
+                    await exit_editor_mode_if_needed(page, progress=progress)
+                    result = await process_html_screenshots(
+                        page,
+                        page_count,
+                        temp_dir,
+                        output_pdf,
+                        clean_watermark=True,
+                        progress=progress,
+                        require_nonblank_pages=True,
+                        hide_overlays=True,
+                    )
             elif file_type in {"excel", "xls", "xlsx"}:
                 emit_progress(progress, "已选择最佳处理方案")
                 try:
