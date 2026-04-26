@@ -13,7 +13,12 @@ from wenku_to_pdf import (
     excel_page_image_items,
     full_page_png_looks_complete,
     is_mostly_blank_image,
+    json_callback_body,
+    merge_structured_html_urls,
     page_image_ready,
+    page_index_from_font_url,
+    page_index_from_resource_url,
+    url_with_query_params,
 )
 
 
@@ -142,6 +147,47 @@ class ExcelDirectImageTest(unittest.TestCase):
             image.save(path)
 
             self.assertTrue(excel_direct_image_looks_complete(path, min_file_bytes=10000))
+
+
+class StructuredResourceTest(unittest.TestCase):
+    def test_adds_edt_mode_without_dropping_existing_query(self):
+        url = url_with_query_params("https://wenku.baidu.com/view/doc?aggId=abc&chatType=chat", edtMode=2)
+
+        self.assertIn("aggId=abc", url)
+        self.assertIn("chatType=chat", url)
+        self.assertIn("edtMode=2", url)
+
+    def test_extracts_callback_json_body(self):
+        self.assertEqual(json_callback_body('wenku_1({"body":[]});'), '{"body":[]}')
+
+    def test_reads_page_index_from_resource_and_font_urls(self):
+        self.assertEqual(page_index_from_resource_url("https://x/docconvert/hash/0.json?x=1"), 1)
+        self.assertEqual(page_index_from_resource_url("https://x/docconvert/hash/11.png?x=1"), 12)
+        self.assertEqual(page_index_from_font_url("https://wkretype.bdimg.com/retype/pipe/id?pn=8&t=ttf"), 8)
+
+    def test_merges_readerinfo_html_urls_by_page_index(self):
+        json_urls = {}
+        png_urls = {}
+        font_urls = {}
+        merge_structured_html_urls(
+            {
+                "data": {
+                    "htmlUrls": {
+                        "json": [{"pageIndex": 3, "pageLoadUrl": "https://example.test/2.json"}],
+                        "png": [{"pageIndex": 3, "pageLoadUrl": "https://example.test/2.png"}],
+                        "ttf": [{"pageIndex": 3, "param": "&md5sum=abc&range=1-2"}],
+                    }
+                }
+            },
+            "docid",
+            json_urls,
+            png_urls,
+            font_urls,
+        )
+
+        self.assertEqual(json_urls[3], "https://example.test/2.json")
+        self.assertEqual(png_urls[3], "https://example.test/2.png")
+        self.assertIn("pn=3", font_urls[3])
 
 
 if __name__ == "__main__":

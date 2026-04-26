@@ -2,3 +2,5 @@ Flask
 playwright
 Pillow
 img2pdf
+PyPDF2
+reportlab==3.6.13

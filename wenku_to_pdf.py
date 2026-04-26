@@ -1,5 +1,6 @@
 ﻿import argparse
 import asyncio
+import base64
 import getpass
 import json
 import os
@@ -9,11 +10,18 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
 import img2pdf
 from PIL import Image, ImageDraw
 from playwright.async_api import async_playwright
+
+try:
+    from PyPDF2 import PdfMerger, PdfReader
+except Exception:
+    from pypdf import PdfMerger, PdfReader
+
+from structured_json_pdf import save_structured_page_pdf
 
 
 TOP_MASK_FIRST_PAGE = 0.08
@@ -98,6 +106,14 @@ def sanitize_filename(name):
     name = re.sub(r'[\\/:*?"<>|]', "_", name)
     name = name.rstrip(". ")
     return name or "百度文库文档"
+
+
+def url_with_query_params(url, **params):
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    for key, value in params.items():
+        query[key] = str(value)
+    return urlunparse(parsed._replace(query=urlencode(query)))
 
 
 def find_json_object_after_marker(html, marker):
@@ -390,6 +406,197 @@ async def download_binary(context, url, output_path, referer):
 def write_pdf_from_images(image_paths, output_pdf):
     with output_pdf.open("wb") as pdf_file:
         pdf_file.write(img2pdf.convert([str(path) for path in image_paths]))
+
+
+class StructuredResourceNotUsable(RuntimeError):
+    pass
+
+
+def json_callback_body(text):
+    match = re.search(r"^[^(]+\((.*)\)\s*;?\s*$", text, flags=re.S)
+    return match.group(1) if match else text
+
+
+def page_index_from_resource_url(url):
+    match = re.search(r"/(\d+)\.(?:json|png)$", urlparse(url).path, flags=re.I)
+    return int(match.group(1)) + 1 if match else None
+
+
+def page_index_from_font_url(url):
+    value = (parse_qs(urlparse(url).query).get("pn") or [""])[0]
+    return int(value) if str(value).isdigit() else None
+
+
+def doc_id_from_data_or_url(data, url):
+    reader = data.get("readerInfo") or {}
+    doc_id = reader.get("docId") or reader.get("doc_id")
+    if doc_id:
+        return doc_id
+    match = re.search(r"/view/([^/?#]+?)(?:\.html)?(?:[?#]|$)", url)
+    return match.group(1) if match else ""
+
+
+def merge_structured_html_urls(payload, doc_id, json_urls, png_urls, font_urls):
+    html_urls = None
+    if isinstance(payload, dict):
+        if isinstance(payload.get("htmlUrls"), dict):
+            html_urls = payload["htmlUrls"]
+        elif isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("htmlUrls"), dict):
+            html_urls = payload["data"]["htmlUrls"]
+    if not html_urls:
+        return
+
+    for item in html_urls.get("json") or []:
+        if item.get("pageLoadUrl") and item.get("pageIndex"):
+            json_urls[int(item["pageIndex"])] = item["pageLoadUrl"]
+    for item in html_urls.get("png") or []:
+        if item.get("pageLoadUrl") and item.get("pageIndex"):
+            png_urls[int(item["pageIndex"])] = item["pageLoadUrl"]
+    for item in html_urls.get("ttf") or []:
+        page_index = int(item.get("pageIndex") or 0)
+        if page_index and doc_id:
+            font_urls[page_index] = (
+                f"https://wkretype.bdimg.com/retype/pipe/{doc_id}"
+                f"?pn={page_index}&t=ttf&rn=1&v=6{item.get('param', '')}"
+            )
+
+
+def initial_structured_resource_urls(data, doc_id):
+    json_urls = {}
+    png_urls = {}
+    font_urls = {}
+    merge_structured_html_urls(data.get("readerInfo") or {}, doc_id, json_urls, png_urls, font_urls)
+    return json_urls, png_urls, font_urls
+
+
+async def download_text(context, url, referer):
+    response = await context.request.get(url, headers={"Referer": referer})
+    if response.status >= 400:
+        raise RuntimeError(f"HTTP {response.status}: {url[:120]}")
+    return await response.text()
+
+
+async def download_bytes(context, url, referer):
+    response = await context.request.get(url, headers={"Referer": referer})
+    if response.status >= 400:
+        raise RuntimeError(f"HTTP {response.status}: {url[:120]}")
+    return await response.body()
+
+
+async def wait_for_pending_response_tasks(pending_response_tasks):
+    if pending_response_tasks:
+        await asyncio.gather(*list(pending_response_tasks), return_exceptions=True)
+
+
+async def collect_structured_resources(page, page_count, json_urls, png_urls, font_urls, pending_response_tasks, progress=None):
+    await click_read_more(page, max_clicks=8)
+    for round_index in range(1, 12):
+        await wait_for_pending_response_tasks(pending_response_tasks)
+        if len(json_urls) >= page_count and len(png_urls) >= page_count:
+            break
+        await scroll_to_load(page, rounds=10, pixels=2000, delay_ms=240)
+        await page.wait_for_timeout(900)
+        emit_progress(progress, f"资源准备 {round_index}: {len(json_urls)}/{page_count}")
+
+
+def merge_page_pdfs(page_pdfs, output_pdf):
+    merger = PdfMerger()
+    try:
+        for page_pdf in page_pdfs:
+            with Path(page_pdf).open("rb") as handle:
+                merger.append(PdfReader(handle))
+        with output_pdf.open("wb") as handle:
+            merger.write(handle)
+    finally:
+        merger.close()
+
+
+async def process_structured_document(context, page, page_count, temp_dir, output_pdf, data, file_type, progress=None):
+    if not page_count:
+        raise StructuredResourceNotUsable("缺少页数，无法进行结构化处理")
+
+    doc_id = doc_id_from_data_or_url(data, page.url)
+    if not doc_id:
+        raise StructuredResourceNotUsable("缺少文档 ID，无法进行结构化处理")
+
+    json_urls, png_urls, font_urls = initial_structured_resource_urls(data, doc_id)
+    pending_response_tasks = set()
+
+    async def handle_response(response):
+        url = response.url
+        try:
+            if "ndocview/readerinfo" in url:
+                merge_structured_html_urls(await response.json(), doc_id, json_urls, png_urls, font_urls)
+            elif "docconvert" in url and ".json" in url:
+                page_index = page_index_from_resource_url(url)
+                if page_index:
+                    json_urls.setdefault(page_index, url)
+            elif "docconvert" in url and ".png" in url:
+                page_index = page_index_from_resource_url(url)
+                if page_index:
+                    png_urls.setdefault(page_index, url)
+            elif "wkretype.bdimg.com/retype/pipe/" in url and "t=ttf" in url:
+                page_index = page_index_from_font_url(url)
+                if page_index:
+                    font_urls.setdefault(page_index, url)
+        except Exception:
+            pass
+
+    def on_response(response):
+        task = asyncio.create_task(handle_response(response))
+        pending_response_tasks.add(task)
+        task.add_done_callback(pending_response_tasks.discard)
+
+    page.on("response", on_response)
+    emit_progress(progress, "正在准备文档资源")
+    await collect_structured_resources(page, page_count, json_urls, png_urls, font_urls, pending_response_tasks, progress=progress)
+    await wait_for_pending_response_tasks(pending_response_tasks)
+
+    missing_json = [index for index in range(1, page_count + 1) if index not in json_urls]
+    missing_png = [index for index in range(1, page_count + 1) if index not in png_urls]
+    if missing_json or missing_png:
+        raise StructuredResourceNotUsable(f"结构化资源不完整，缺少页面：{(missing_json or missing_png)[:10]}")
+
+    use_default_font = file_type in {"excel", "xls", "xlsx"}
+    default_font = "STSong-Light" if use_default_font else None
+    emit_progress(progress, f"页面资源准备完成，共 {page_count} 页")
+
+    if not use_default_font:
+        for index in range(1, page_count + 1):
+            if index not in font_urls:
+                raise StructuredResourceNotUsable(f"第 {index} 页缺少字体资源")
+
+    for index in range(1, page_count + 1):
+        raw_json = await download_text(context, json_urls[index], page.url)
+        (temp_dir / f"{index}.json").write_text(json_callback_body(raw_json), encoding="utf-8")
+        (temp_dir / f"{index}.png").write_bytes(await download_bytes(context, png_urls[index], page.url))
+        if not use_default_font:
+            font_css = await download_text(context, font_urls[index], page.url)
+            (temp_dir / f"{index}.font.css").write_text(font_css, encoding="utf-8")
+            for encoded, family in re.findall(
+                r"@font-face \{src: url\(data:font/opentype;base64,(.*?)\)format\('truetype'\);font-family: '(.*?)';",
+                font_css,
+            ):
+                (temp_dir / f"{family}.ttf").write_bytes(base64.b64decode(encoded))
+        emit_progress(progress, f"处理第 {index}/{page_count} 页 ✅")
+
+    page_pdfs = []
+    font_replace = {}
+    for index in range(1, page_count + 1):
+        font_replace, page_pdf = save_structured_page_pdf(temp_dir, index, font_replace=font_replace, default_font=default_font)
+        page_pdfs.append(page_pdf)
+
+    emit_progress(progress, "页面处理完成，正在生成最终文件")
+    merge_page_pdfs(page_pdfs, output_pdf)
+    return {"mode": "structured-json-pdf", "pages": page_count}
+
+
+async def load_structured_page_data(page, url, fallback_data):
+    structured_url = url_with_query_params(url, edtMode=2)
+    if page.url != structured_url:
+        await page.goto(structured_url, wait_until="domcontentloaded", timeout=60000)
+        await safe_wait(page)
+    return extract_page_data(await page.content()) or fallback_data
 
 
 async def process_ppt(context, page, page_count, temp_dir, output_pdf, data, progress=None):
@@ -858,7 +1065,7 @@ async def convert(url, cookie_text, output_dir, temp_root=None, keep_temp=False,
             await browser_context.add_cookies(parse_cookie_header(cookie_text))
 
             emit_progress(progress, "正在进入文档空间")
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await page.goto(url_with_query_params(url, edtMode=2), wait_until="domcontentloaded", timeout=60000)
             await safe_wait(page)
             emit_progress(progress, "正在读取文档信息")
 
@@ -873,7 +1080,6 @@ async def convert(url, cookie_text, output_dir, temp_root=None, keep_temp=False,
 
             emit_progress(progress, f"文档名称：{title}")
             emit_progress(progress, f"文档页数：{page_count or 'unknown'}")
-            await exit_editor_mode_if_needed(page, progress=progress)
 
             if file_type in {"ppt", "pptx"} or tpl_key == "new_view":
                 emit_progress(progress, "已选择最佳处理方案")
@@ -881,8 +1087,85 @@ async def convert(url, cookie_text, output_dir, temp_root=None, keep_temp=False,
             elif file_type == "pdf":
                 emit_progress(progress, "已选择最佳处理方案")
                 try:
-                    result = await process_pdf_page_images(browser_context, page, page_count, temp_dir, output_pdf, data, progress=progress)
-                except PdfDirectImageNotUsable:
+                    structured_data = await load_structured_page_data(page, url, data)
+                    _, _, structured_file_type, _, structured_page_count = reader_info(structured_data)
+                    result = await process_structured_document(
+                        browser_context,
+                        page,
+                        structured_page_count or page_count,
+                        temp_dir,
+                        output_pdf,
+                        structured_data,
+                        structured_file_type or file_type,
+                        progress=progress,
+                    )
+                except StructuredResourceNotUsable:
+                    emit_progress(progress, "正在切换备用处理方案")
+                    try:
+                        result = await process_pdf_page_images(browser_context, page, page_count, temp_dir, output_pdf, data, progress=progress)
+                    except PdfDirectImageNotUsable:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                        await safe_wait(page)
+                        await exit_editor_mode_if_needed(page, progress=progress)
+                        result = await process_html_screenshots(
+                            page,
+                            page_count,
+                            temp_dir,
+                            output_pdf,
+                            clean_watermark=True,
+                            progress=progress,
+                            require_nonblank_pages=True,
+                            hide_overlays=True,
+                        )
+            elif file_type in {"excel", "xls", "xlsx"}:
+                emit_progress(progress, "已选择最佳处理方案")
+                try:
+                    structured_data = await load_structured_page_data(page, url, data)
+                    _, _, structured_file_type, _, structured_page_count = reader_info(structured_data)
+                    result = await process_structured_document(
+                        browser_context,
+                        page,
+                        structured_page_count or page_count,
+                        temp_dir,
+                        output_pdf,
+                        structured_data,
+                        structured_file_type or file_type,
+                        progress=progress,
+                    )
+                except StructuredResourceNotUsable:
+                    emit_progress(progress, "正在切换备用处理方案")
+                    try:
+                        result = await process_excel_page_images(browser_context, page, page_count, temp_dir, output_pdf, data, progress=progress)
+                    except ExcelDirectImageNotUsable:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                        await safe_wait(page)
+                        await exit_editor_mode_if_needed(page, progress=progress)
+                        result = await process_html_screenshots(
+                            page,
+                            page_count,
+                            temp_dir,
+                            output_pdf,
+                            clean_watermark=True,
+                            progress=progress,
+                            require_nonblank_pages=True,
+                            hide_overlays=True,
+                        )
+            elif file_type in {"word", "doc", "docx"}:
+                emit_progress(progress, "已选择最佳处理方案")
+                try:
+                    structured_data = await load_structured_page_data(page, url, data)
+                    _, _, structured_file_type, _, structured_page_count = reader_info(structured_data)
+                    result = await process_structured_document(
+                        browser_context,
+                        page,
+                        structured_page_count or page_count,
+                        temp_dir,
+                        output_pdf,
+                        structured_data,
+                        structured_file_type or file_type,
+                        progress=progress,
+                    )
+                except StructuredResourceNotUsable:
                     emit_progress(progress, "正在切换备用处理方案")
                     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                     await safe_wait(page)
@@ -894,29 +1177,12 @@ async def convert(url, cookie_text, output_dir, temp_root=None, keep_temp=False,
                         output_pdf,
                         clean_watermark=True,
                         progress=progress,
-                        require_nonblank_pages=True,
-                        hide_overlays=True,
-                    )
-            elif file_type in {"excel", "xls", "xlsx"}:
-                emit_progress(progress, "已选择最佳处理方案")
-                try:
-                    result = await process_excel_page_images(browser_context, page, page_count, temp_dir, output_pdf, data, progress=progress)
-                except ExcelDirectImageNotUsable:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    await safe_wait(page)
-                    await exit_editor_mode_if_needed(page, progress=progress)
-                    result = await process_html_screenshots(
-                        page,
-                        page_count,
-                        temp_dir,
-                        output_pdf,
-                        clean_watermark=True,
-                        progress=progress,
-                        require_nonblank_pages=True,
-                        hide_overlays=True,
+                        require_nonblank_pages=False,
+                        hide_overlays=False,
                     )
             else:
                 emit_progress(progress, "已选择最佳处理方案")
+                await exit_editor_mode_if_needed(page, progress=progress)
                 result = await process_html_screenshots(
                     page,
                     page_count,
