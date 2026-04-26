@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import queue
+import re
 import secrets
 import sqlite3
 import threading
@@ -33,6 +34,8 @@ MAX_QUEUE_WORKERS = 2
 DOWNLOAD_TTL_SECONDS = int(os.environ.get("WENKU_DOWNLOAD_TTL_SECONDS", "3600"))
 DOWNLOAD_CLEANUP_INTERVAL_SECONDS = int(os.environ.get("WENKU_DOWNLOAD_CLEANUP_INTERVAL_SECONDS", "300"))
 BROWSER_RESTART_AFTER_JOBS = int(os.environ.get("WENKU_BROWSER_RESTART_AFTER_JOBS", "20"))
+JOB_TIMEOUT_SECONDS = float(os.environ.get("WENKU_JOB_TIMEOUT_SECONDS", "900"))
+JOB_RETRY_COUNT = int(os.environ.get("WENKU_JOB_RETRY_COUNT", "1"))
 COOKIE_TEST_URL = os.environ.get("WENKU_COOKIE_TEST_URL", "https://wenku.baidu.com/")
 CORS_ORIGINS = [
     item.strip()
@@ -89,6 +92,14 @@ def parse_cookie_pool(cookie_text):
             blocks = non_empty_lines
 
     return [cookie for cookie in blocks if cookie][:MAX_COOKIE_POOL_SIZE]
+
+
+def normalize_submitted_url(url):
+    normalized = (url or "").strip()
+    matches = list(re.finditer(r"https?://wenku\.baidu\.com/view/", normalized, flags=re.I))
+    if len(matches) >= 2:
+        return normalized[:matches[1].start()].strip()
+    return normalized
 
 
 def read_cookie_pool():
@@ -654,9 +665,11 @@ def get_job_snapshot(job_id):
 
 
 class WorkerBrowserRuntime:
-    def __init__(self, worker_id, restart_after_jobs):
+    def __init__(self, worker_id, restart_after_jobs, job_timeout_seconds=JOB_TIMEOUT_SECONDS, retry_count=JOB_RETRY_COUNT):
         self.worker_id = worker_id
         self.restart_after_jobs = max(1, restart_after_jobs)
+        self.job_timeout_seconds = float(job_timeout_seconds) if job_timeout_seconds else None
+        self.retry_count = max(0, int(retry_count))
         self.loop = asyncio.new_event_loop()
         self.playwright = None
         self.browser = None
@@ -686,16 +699,34 @@ class WorkerBrowserRuntime:
         self.completed_jobs = 0
 
     async def convert(self, **kwargs):
-        browser = await self.ensure_browser()
-        try:
-            result = await convert_with_browser(browser=browser, **kwargs)
-            self.completed_jobs += 1
-            if self.completed_jobs >= self.restart_after_jobs:
+        attempts = self.retry_count + 1
+        progress = kwargs.get("progress")
+        for attempt in range(1, attempts + 1):
+            browser = await self.ensure_browser()
+            try:
+                operation = convert_with_browser(browser=browser, **kwargs)
+                if self.job_timeout_seconds:
+                    result = await asyncio.wait_for(operation, timeout=self.job_timeout_seconds)
+                else:
+                    result = await operation
+                self.completed_jobs += 1
+                if self.completed_jobs >= self.restart_after_jobs:
+                    await self.restart_browser()
+                return result
+            except asyncio.TimeoutError as exc:
                 await self.restart_browser()
-            return result
-        except Exception:
-            await self.restart_browser()
-            raise
+                if attempt < attempts:
+                    if progress:
+                        progress("处理环境响应超时，已自动重置并重试")
+                    continue
+                raise TimeoutError(f"任务超过 {self.job_timeout_seconds:g} 秒未完成，已自动释放通道") from exc
+            except Exception:
+                await self.restart_browser()
+                if attempt < attempts:
+                    if progress:
+                        progress("处理环境已自动重置，正在重试")
+                    continue
+                raise
 
     def run_convert(self, **kwargs):
         asyncio.set_event_loop(self.loop)
@@ -745,7 +776,7 @@ def run_convert_job(job_id, url, cookie, cookie_slot=None, cookie_total=None, br
 
 
 def queued_convert_worker(worker_id):
-    browser_runtime = WorkerBrowserRuntime(worker_id, BROWSER_RESTART_AFTER_JOBS)
+    browser_runtime = WorkerBrowserRuntime(worker_id, BROWSER_RESTART_AFTER_JOBS, JOB_TIMEOUT_SECONDS, JOB_RETRY_COUNT)
     while True:
         job_id, url, override_cookie = job_queue.get()
         has_waiting_marker = False
@@ -820,6 +851,8 @@ def api_status():
         "queued_jobs": queued_job_count(),
         "download_ttl_seconds": DOWNLOAD_TTL_SECONDS,
         "browser_restart_after_jobs": BROWSER_RESTART_AFTER_JOBS,
+        "job_timeout_seconds": JOB_TIMEOUT_SECONDS,
+        "job_retry_count": JOB_RETRY_COUNT,
         "download_dir": DOWNLOAD_DIR,
         "token_required": True,
     })
@@ -950,7 +983,7 @@ def api_token_verify():
 @app.route("/api/convert", methods=["POST"])
 def api_convert():
     data = request.get_json(silent=True) or {}
-    url = (data.get("url") or "").strip()
+    url = normalize_submitted_url(data.get("url") or "")
     access_token = request_access_token(data)
     access_scope = request_access_scope(data)
     override_cookie = (data.get("cookie") or "").strip()

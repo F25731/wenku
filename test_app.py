@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +8,17 @@ from app import MAX_COOKIE_POOL_SIZE, parse_cookie_pool
 
 
 class CookiePoolTest(unittest.TestCase):
+    def test_duplicate_shared_url_is_trimmed_to_first_wenku_link(self):
+        duplicated = (
+            "http://wenku.baidu.com/view/47025eeb781cfad6195f312b3169a4517623e559?from_appshare=readpage"
+            "http://wenku.baidu.com/view/47025eeb781cfad6195f312b3169a4517623e559?from_appshare=readpage"
+        )
+
+        self.assertEqual(
+            app.normalize_submitted_url(duplicated),
+            "http://wenku.baidu.com/view/47025eeb781cfad6195f312b3169a4517623e559?from_appshare=readpage",
+        )
+
     def test_single_cookie_still_works(self):
         self.assertEqual(parse_cookie_pool("BAIDUID=a; BDUSS=b"), ["BAIDUID=a; BDUSS=b"])
 
@@ -82,6 +94,68 @@ class CookiePoolTest(unittest.TestCase):
 
         app.COOKIE_FILE = old_cookie_file
         app.COOKIE_POOL_FILE = old_cookie_pool_file
+
+
+class WorkerBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
+    async def test_convert_error_restarts_browser_and_retries_once(self):
+        old_convert_with_browser = app.convert_with_browser
+        calls = {"count": 0}
+
+        async def flaky_convert(**kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise RuntimeError("temporary browser error")
+            return {"output": "ok.pdf", "pages": 1}
+
+        class RetryRuntime(app.WorkerBrowserRuntime):
+            def __init__(self):
+                super().__init__(worker_id=1, restart_after_jobs=20, job_timeout_seconds=1, retry_count=1)
+                self.restart_count = 0
+
+            async def ensure_browser(self):
+                return object()
+
+            async def restart_browser(self):
+                self.restart_count += 1
+
+        app.convert_with_browser = flaky_convert
+        runtime = RetryRuntime()
+        try:
+            result = await runtime.convert(url="u", cookie_text="c", output_dir="out")
+
+            self.assertEqual(result["output"], "ok.pdf")
+            self.assertEqual(calls["count"], 2)
+            self.assertEqual(runtime.restart_count, 1)
+        finally:
+            app.convert_with_browser = old_convert_with_browser
+            runtime.loop.close()
+
+    async def test_convert_timeout_restarts_browser(self):
+        old_convert_with_browser = app.convert_with_browser
+
+        async def slow_convert(**kwargs):
+            await asyncio.sleep(1)
+
+        class TimeoutRuntime(app.WorkerBrowserRuntime):
+            def __init__(self):
+                super().__init__(worker_id=1, restart_after_jobs=20, job_timeout_seconds=0.01)
+                self.restarted = False
+
+            async def ensure_browser(self):
+                return object()
+
+            async def restart_browser(self):
+                self.restarted = True
+
+        app.convert_with_browser = slow_convert
+        runtime = TimeoutRuntime()
+        try:
+            with self.assertRaises(TimeoutError):
+                await runtime.convert(url="u", cookie_text="c", output_dir="out")
+            self.assertTrue(runtime.restarted)
+        finally:
+            app.convert_with_browser = old_convert_with_browser
+            runtime.loop.close()
 
 
 class TokenBackendTest(unittest.TestCase):
