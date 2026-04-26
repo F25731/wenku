@@ -1,0 +1,18 @@
+services:
+  wenku:
+    build: .
+    image: wenku-to-pdf:latest
+    container_name: wenku-to-pdf
+    restart: unless-stopped
+    shm_size: "1gb"
+    ports:
+      - "5000:5000"
+    environment:
+      WENKU_HOST: "0.0.0.0"
+      WENKU_PORT: "5000"
+      WENKU_DATA_DIR: "/app/data"
+      WENKU_ENABLE_SERVER_ADMIN: "0"
+      WENKU_ADMIN_TOKEN: "change-this-admin-token"
+      WENKU_CORS_ORIGINS: "null,http://localhost,http://127.0.0.1"
+    volumes:
+      - ./data:/app/data

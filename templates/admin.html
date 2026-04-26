@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Token 后台</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body {
+            min-height: 100vh;
+            background:
+                radial-gradient(circle at top right, rgba(255, 255, 255, 0.22), transparent 30rem),
+                linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .glass-card {
+            background: rgba(255, 255, 255, 0.92);
+            backdrop-filter: blur(14px);
+            border: 1px solid rgba(255, 255, 255, 0.42);
+            box-shadow: 0 18px 60px rgba(31, 38, 135, 0.28);
+        }
+        .token-mask {
+            background:
+                radial-gradient(circle at 18% 18%, rgba(255,255,255,0.26), transparent 26rem),
+                rgba(15, 23, 42, 0.52);
+            backdrop-filter: blur(12px);
+        }
+    </style>
+</head>
+<body class="p-4 antialiased text-gray-800">
+    <main class="mx-auto max-w-6xl">
+        <header class="glass-card mb-5 rounded-2xl p-6">
+            <div class="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
+                <div>
+                    <div class="mb-2 inline-flex items-center rounded-full bg-indigo-50 px-3 py-1 text-xs font-semibold text-indigo-700">
+                        <i class="fas fa-shield-alt mr-2"></i>访问后台
+                    </div>
+                    <h1 class="text-3xl font-bold text-gray-900">Token 管理</h1>
+                    <p class="mt-2 text-sm text-gray-500">创建授权、维护 Cookie、查看运行状态。</p>
+                </div>
+                <div class="flex gap-2">
+                    <a href="/" class="inline-flex items-center rounded-xl bg-white px-4 py-2 text-sm font-semibold text-indigo-700 shadow-sm hover:bg-indigo-50">
+                        <i class="fas fa-home mr-2"></i>首页
+                    </a>
+                    <button id="logoutBtn" class="inline-flex items-center rounded-xl bg-gray-900 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-gray-800">
+                        <i class="fas fa-lock mr-2"></i>锁定
+                    </button>
+                </div>
+            </div>
+        </header>
+
+        <section class="grid gap-5 lg:grid-cols-[360px_1fr]">
+            <form id="createForm" class="glass-card rounded-2xl p-5">
+                <h2 class="mb-4 text-lg font-bold text-gray-900">新建 Token</h2>
+                <label class="mb-2 block text-sm font-semibold text-gray-700" for="days">有效天数</label>
+                <input id="days" type="number" min="1" max="3650" value="30"
+                    class="mb-4 w-full rounded-xl border border-gray-300 bg-white/90 px-4 py-3 outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500">
+                <label class="mb-2 block text-sm font-semibold text-gray-700" for="remark">备注</label>
+                <input id="remark" type="text" maxlength="80" placeholder="例如：同学A / 课堂演示"
+                    class="mb-5 w-full rounded-xl border border-gray-300 bg-white/90 px-4 py-3 outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500">
+                <div class="mb-5 grid grid-cols-2 gap-3">
+                    <label class="flex cursor-pointer items-center gap-2 rounded-xl border border-indigo-100 bg-indigo-50 px-3 py-3 text-sm font-semibold text-indigo-700">
+                        <input id="allowWeb" type="checkbox" checked class="h-4 w-4 accent-indigo-600">
+                        网站使用
+                    </label>
+                    <label class="flex cursor-pointer items-center gap-2 rounded-xl border border-indigo-100 bg-indigo-50 px-3 py-3 text-sm font-semibold text-indigo-700">
+                        <input id="allowApi" type="checkbox" checked class="h-4 w-4 accent-indigo-600">
+                        接口调用
+                    </label>
+                </div>
+                <button class="flex w-full items-center justify-center rounded-xl bg-indigo-600 px-6 py-3 font-semibold text-white shadow-lg shadow-indigo-600/25 hover:bg-indigo-700">
+                    <i class="fas fa-plus mr-2"></i>生成
+                </button>
+                <div id="createMessage" class="mt-4 hidden rounded-lg p-3 text-sm"></div>
+            </form>
+
+            <section class="glass-card rounded-2xl p-5">
+                <div class="mb-4 flex items-center justify-between gap-3">
+                    <div>
+                        <h2 class="text-lg font-bold text-gray-900">授权列表</h2>
+                        <p id="summaryText" class="mt-1 text-xs text-gray-500">正在读取...</p>
+                    </div>
+                    <button id="refreshBtn" class="inline-flex items-center rounded-xl bg-white px-4 py-2 text-sm font-semibold text-indigo-700 shadow-sm hover:bg-indigo-50">
+                        <i class="fas fa-rotate mr-2"></i>刷新
+                    </button>
+                </div>
+                <div id="tokenList" class="space-y-3"></div>
+            </section>
+        </section>
+
+        <section class="glass-card mt-5 rounded-2xl p-5">
+            <div class="mb-4 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+                <div>
+                    <h2 class="text-lg font-bold text-gray-900">Cookie 池</h2>
+                    <p id="cookieSummary" class="mt-1 text-xs text-gray-500">最多 10 个，系统会按数量自动分配处理通道。</p>
+                </div>
+                <button id="testCookiesBtn" class="inline-flex items-center rounded-xl bg-white px-4 py-2 text-sm font-semibold text-indigo-700 shadow-sm hover:bg-indigo-50">
+                    <i class="fas fa-vial mr-2"></i>一键测试
+                </button>
+            </div>
+
+            <form id="cookieCreateForm" class="mb-5 grid gap-3 lg:grid-cols-[220px_1fr_auto]">
+                <input id="cookieName" type="text" maxlength="40" placeholder="自定义名字"
+                    class="rounded-xl border border-gray-300 bg-white/90 px-4 py-3 text-sm outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500">
+                <input id="cookieValue" type="text" placeholder="粘贴 Cookie"
+                    class="rounded-xl border border-gray-300 bg-white/90 px-4 py-3 font-mono text-xs outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500">
+                <button class="inline-flex items-center justify-center rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700">
+                    <i class="fas fa-plus mr-2"></i>添加
+                </button>
+            </form>
+
+            <div id="cookieMessage" class="mb-4 hidden rounded-lg p-3 text-sm"></div>
+            <div id="cookieList" class="grid gap-3 md:grid-cols-2"></div>
+        </section>
+    </main>
+
+    <div id="adminModal" class="token-mask fixed inset-0 z-50 flex items-center justify-center p-4">
+        <section class="glass-card w-full max-w-md rounded-2xl p-6">
+            <div class="mb-5">
+                <div class="mb-2 inline-flex items-center rounded-full bg-indigo-50 px-3 py-1 text-xs font-semibold text-indigo-700">
+                    <i class="fas fa-key mr-2"></i>后台验证
+                </div>
+                <h2 class="text-2xl font-bold text-gray-900">输入后台口令</h2>
+                <p class="mt-2 text-sm text-gray-500">口令保存在同目录 admin_token.txt。</p>
+            </div>
+            <form id="adminForm" class="space-y-4">
+                <input id="adminToken" type="password" autocomplete="off" placeholder="粘贴后台口令"
+                    class="w-full rounded-xl border border-gray-300 bg-white/90 px-4 py-3 font-mono text-sm outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500">
+                <button id="adminSubmit" type="submit"
+                    class="flex w-full items-center justify-center rounded-xl bg-indigo-600 px-6 py-3 font-semibold text-white shadow-lg shadow-indigo-600/25 hover:bg-indigo-700">
+                    <i class="fas fa-unlock mr-2"></i>进入后台
+                </button>
+                <div id="adminMessage" class="hidden rounded-lg bg-red-50 p-3 text-sm text-red-600"></div>
+            </form>
+        </section>
+    </div>
+
+    <script>
+        const ADMIN_STORAGE_KEY = 'wenku_admin_token';
+        const adminModal = document.getElementById('adminModal');
+        const adminForm = document.getElementById('adminForm');
+        const adminTokenInput = document.getElementById('adminToken');
+        const adminSubmit = document.getElementById('adminSubmit');
+        const adminMessage = document.getElementById('adminMessage');
+        const createForm = document.getElementById('createForm');
+        const createMessage = document.getElementById('createMessage');
+        const tokenList = document.getElementById('tokenList');
+        const summaryText = document.getElementById('summaryText');
+        const refreshBtn = document.getElementById('refreshBtn');
+        const logoutBtn = document.getElementById('logoutBtn');
+        const cookieCreateForm = document.getElementById('cookieCreateForm');
+        const cookieName = document.getElementById('cookieName');
+        const cookieValue = document.getElementById('cookieValue');
+        const cookieSummary = document.getElementById('cookieSummary');
+        const cookieList = document.getElementById('cookieList');
+        const cookieMessage = document.getElementById('cookieMessage');
+        const testCookiesBtn = document.getElementById('testCookiesBtn');
+
+        let adminToken = localStorage.getItem(ADMIN_STORAGE_KEY) || '';
+
+        function escapeHtml(value) {
+            return String(value)
+                .replaceAll('&', '&amp;')
+                .replaceAll('<', '&lt;')
+                .replaceAll('>', '&gt;')
+                .replaceAll('"', '&quot;')
+                .replaceAll("'", '&#039;');
+        }
+
+        function showMessage(node, message, ok = false) {
+            node.className = ok
+                ? 'mt-4 rounded-lg bg-green-50 p-3 text-sm text-green-700'
+                : 'mt-4 rounded-lg bg-red-50 p-3 text-sm text-red-600';
+            node.textContent = message;
+            node.classList.remove('hidden');
+        }
+
+        async function adminFetch(url, options = {}) {
+            const headers = Object.assign(
+                { 'Content-Type': 'application/json', 'X-Admin-Token': adminToken },
+                options.headers || {}
+            );
+            const response = await fetch(url, Object.assign({}, options, { headers }));
+            const data = await response.json();
+            if (!response.ok) {
+                if (response.status === 401) {
+                    adminModal.classList.remove('hidden');
+                    localStorage.removeItem(ADMIN_STORAGE_KEY);
+                }
+                throw new Error(data.error || '请求失败');
+            }
+            return data;
+        }
+
+        function statusLabel(token) {
+            if (!token.enabled) return ['已停用', 'bg-gray-100 text-gray-600'];
+            if (token.expired) return ['已过期', 'bg-red-50 text-red-600'];
+            return ['可使用', 'bg-green-50 text-green-700'];
+        }
+
+        function accessLink(token) {
+            return `${window.location.origin}/?token=${encodeURIComponent(token)}`;
+        }
+
+        function tokenScopeBadges(token) {
+            const badges = [];
+            if (token.allow_web) {
+                badges.push('<span class="rounded-full bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700">网站</span>');
+            }
+            if (token.allow_api) {
+                badges.push('<span class="rounded-full bg-violet-50 px-3 py-1 text-xs font-semibold text-violet-700">接口</span>');
+            }
+            return badges.join('');
+        }
+
+        function renderTokens(tokens) {
+            summaryText.textContent = `共 ${tokens.length} 个 Token`;
+            if (!tokens.length) {
+                tokenList.innerHTML = '<div class="rounded-xl bg-white/75 p-5 text-sm text-gray-500">暂无授权。</div>';
+                return;
+            }
+            tokenList.innerHTML = tokens.map((token) => {
+                const [label, tone] = statusLabel(token);
+                const link = accessLink(token.token);
+                return `
+                    <article class="rounded-xl border border-gray-200 bg-white/80 p-4 shadow-sm">
+                        <div class="mb-3 flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+                            <div class="min-w-0">
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <span class="rounded-full px-3 py-1 text-xs font-semibold ${tone}">${label}</span>
+                                    ${tokenScopeBadges(token)}
+                                    <span class="text-sm font-semibold text-gray-900">${escapeHtml(token.remark || '未备注')}</span>
+                                </div>
+                                <div class="mt-2 break-all rounded-lg bg-gray-950 px-3 py-2 font-mono text-xs text-indigo-50">${escapeHtml(token.token)}</div>
+                            </div>
+                            <div class="flex shrink-0 flex-wrap gap-2">
+                                <button data-copy="${escapeHtml(link)}" class="copyBtn rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white hover:bg-indigo-700">
+                                    <i class="fas fa-copy mr-1"></i>链接
+                                </button>
+                                <button data-copy="${escapeHtml(token.token)}" class="copyBtn rounded-lg bg-white px-3 py-2 text-xs font-semibold text-indigo-700 shadow-sm hover:bg-indigo-50">
+                                    <i class="fas fa-key mr-1"></i>Token
+                                </button>
+                                <button data-id="${token.id}" data-enabled="${token.enabled ? '0' : '1'}" class="toggleBtn rounded-lg bg-white px-3 py-2 text-xs font-semibold text-indigo-700 shadow-sm hover:bg-indigo-50">
+                                    ${token.enabled ? '停用' : '启用'}
+                                </button>
+                                <button data-id="${token.id}" class="deleteBtn rounded-lg bg-red-50 px-3 py-2 text-xs font-semibold text-red-600 hover:bg-red-100">
+                                    删除
+                                </button>
+                            </div>
+                        </div>
+                        <div class="grid gap-2 text-xs text-gray-500 sm:grid-cols-4">
+                            <span>到期：${escapeHtml(token.expires_at_text)}</span>
+                            <span>次数：${token.usage_count}</span>
+                            <span>最近：${escapeHtml(token.last_used_at_text || '--')}</span>
+                            <span>来源：${escapeHtml(token.last_ip || '--')}</span>
+                        </div>
+                    </article>
+                `;
+            }).join('');
+        }
+
+        function renderCookies(data, results = []) {
+            const resultMap = new Map(results.map((item) => [item.id || item.index, item]));
+            cookieSummary.textContent = `当前 ${data.count || 0}/${data.max_count || 10} 个 Cookie，并发通道 ${data.concurrency_limit || 1}`;
+            const cookies = data.cookies || [];
+            if (!cookies.length) {
+                cookieList.innerHTML = '<div class="rounded-xl bg-white/75 p-4 text-sm text-gray-500">暂无 Cookie。</div>';
+                return;
+            }
+            cookieList.innerHTML = cookies.map((item) => {
+                const result = resultMap.get(item.id) || resultMap.get(item.index);
+                const tone = !result ? 'bg-gray-100 text-gray-600' : result.ok ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-600';
+                const label = !result ? '未测试' : result.ok ? '可连接' : '需检查';
+                return `
+                    <article class="rounded-xl border border-gray-200 bg-white/80 p-4 shadow-sm" data-cookie-card="${escapeHtml(item.id)}">
+                        <div class="mb-2 flex items-center justify-between gap-3">
+                            <input data-id="${escapeHtml(item.id)}" value="${escapeHtml(item.name || 'Cookie ' + item.index)}"
+                                class="cookieNameInput min-w-0 flex-1 rounded-lg border border-transparent bg-transparent px-2 py-1 font-semibold text-gray-900 outline-none focus:border-indigo-300 focus:bg-white">
+                            <span class="rounded-full px-3 py-1 text-xs font-semibold ${tone}">${label}</span>
+                        </div>
+                        <div class="break-all rounded-lg bg-gray-950 px-3 py-2 font-mono text-xs text-indigo-50">${escapeHtml(item.preview)}</div>
+                        <div class="mt-2 flex items-center justify-between text-xs text-gray-500">
+                            <span>长度：${item.length}</span>
+                            <span>${result ? escapeHtml(result.message) : ''}</span>
+                        </div>
+                        <div class="mt-3 flex flex-wrap gap-2">
+                            <button data-id="${escapeHtml(item.id)}" class="testCookieBtn rounded-lg bg-white px-3 py-2 text-xs font-semibold text-indigo-700 shadow-sm hover:bg-indigo-50">
+                                <i class="fas fa-vial mr-1"></i>测试
+                            </button>
+                            <button data-id="${escapeHtml(item.id)}" class="renameCookieBtn rounded-lg bg-indigo-50 px-3 py-2 text-xs font-semibold text-indigo-700 hover:bg-indigo-100">
+                                <i class="fas fa-pen mr-1"></i>保存名字
+                            </button>
+                            <button data-id="${escapeHtml(item.id)}" class="deleteCookieBtn rounded-lg bg-red-50 px-3 py-2 text-xs font-semibold text-red-600 hover:bg-red-100">
+                                删除
+                            </button>
+                        </div>
+                    </article>
+                `;
+            }).join('');
+        }
+
+        async function loadTokens() {
+            const data = await adminFetch('/api/admin/tokens');
+            renderTokens(data.tokens || []);
+        }
+
+        async function loadCookies() {
+            const data = await adminFetch('/api/admin/cookies');
+            renderCookies(data);
+        }
+
+        async function loadAll() {
+            adminModal.classList.add('hidden');
+            await Promise.all([loadTokens(), loadCookies()]);
+        }
+
+        adminForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            adminToken = adminTokenInput.value.trim();
+            adminSubmit.disabled = true;
+            adminSubmit.innerHTML = '<i class="fas fa-spinner mr-2"></i>验证中...';
+            adminMessage.classList.add('hidden');
+            try {
+                await loadAll();
+                localStorage.setItem(ADMIN_STORAGE_KEY, adminToken);
+            } catch (error) {
+                adminMessage.textContent = error.message;
+                adminMessage.classList.remove('hidden');
+            } finally {
+                adminSubmit.disabled = false;
+                adminSubmit.innerHTML = '<i class="fas fa-unlock mr-2"></i>进入后台';
+            }
+        });
+
+        createForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            createMessage.classList.add('hidden');
+            try {
+                const days = document.getElementById('days').value;
+                const remark = document.getElementById('remark').value;
+                const allowWeb = document.getElementById('allowWeb').checked;
+                const allowApi = document.getElementById('allowApi').checked;
+                const data = await adminFetch('/api/admin/tokens', {
+                    method: 'POST',
+                    body: JSON.stringify({ days, remark, allow_web: allowWeb, allow_api: allowApi })
+                });
+                showMessage(createMessage, `已生成：${data.token.token}`, true);
+                await loadTokens();
+            } catch (error) {
+                showMessage(createMessage, error.message);
+            }
+        });
+
+        tokenList.addEventListener('click', async (event) => {
+            const copyBtn = event.target.closest('.copyBtn');
+            const toggleBtn = event.target.closest('.toggleBtn');
+            const deleteBtn = event.target.closest('.deleteBtn');
+
+            if (copyBtn) {
+                const oldHtml = copyBtn.innerHTML;
+                await navigator.clipboard.writeText(copyBtn.dataset.copy);
+                copyBtn.innerHTML = '<i class="fas fa-check mr-1"></i>已复制';
+                setTimeout(() => copyBtn.innerHTML = oldHtml, 1200);
+                return;
+            }
+
+            if (toggleBtn) {
+                await adminFetch(`/api/admin/tokens/${toggleBtn.dataset.id}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify({ enabled: toggleBtn.dataset.enabled === '1' })
+                });
+                await loadTokens();
+                return;
+            }
+
+            if (deleteBtn && confirm('确认删除这个 Token？')) {
+                await adminFetch(`/api/admin/tokens/${deleteBtn.dataset.id}`, { method: 'DELETE' });
+                await loadTokens();
+            }
+        });
+
+        cookieCreateForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            cookieMessage.classList.add('hidden');
+            try {
+                const data = await adminFetch('/api/admin/cookies', {
+                    method: 'POST',
+                    body: JSON.stringify({ name: cookieName.value, cookie: cookieValue.value })
+                });
+                cookieName.value = '';
+                cookieValue.value = '';
+                renderCookies(data);
+                showMessage(cookieMessage, data.message, true);
+            } catch (error) {
+                showMessage(cookieMessage, error.message);
+            }
+        });
+
+        cookieList.addEventListener('click', async (event) => {
+            const testBtn = event.target.closest('.testCookieBtn');
+            const renameBtn = event.target.closest('.renameCookieBtn');
+            const deleteBtn = event.target.closest('.deleteCookieBtn');
+
+            if (testBtn) {
+                const oldHtml = testBtn.innerHTML;
+                testBtn.disabled = true;
+                testBtn.innerHTML = '<i class="fas fa-spinner mr-1"></i>测试中';
+                try {
+                    const [cookieData, testData] = await Promise.all([
+                        adminFetch('/api/admin/cookies'),
+                        adminFetch('/api/admin/cookies/test', {
+                            method: 'POST',
+                            body: JSON.stringify({ id: testBtn.dataset.id })
+                        })
+                    ]);
+                    renderCookies(cookieData, testData.results || []);
+                } catch (error) {
+                    showMessage(cookieMessage, error.message);
+                } finally {
+                    testBtn.disabled = false;
+                    testBtn.innerHTML = oldHtml;
+                }
+                return;
+            }
+
+            if (renameBtn) {
+                const card = renameBtn.closest('[data-cookie-card]');
+                const input = card.querySelector('.cookieNameInput');
+                await adminFetch(`/api/admin/cookies/${renameBtn.dataset.id}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify({ name: input.value })
+                });
+                await loadCookies();
+                showMessage(cookieMessage, '已保存名字', true);
+                return;
+            }
+
+            if (deleteBtn && confirm('确认删除这个 Cookie？')) {
+                await adminFetch(`/api/admin/cookies/${deleteBtn.dataset.id}`, { method: 'DELETE' });
+                await loadCookies();
+                showMessage(cookieMessage, '已删除 Cookie', true);
+            }
+        });
+
+        testCookiesBtn.addEventListener('click', async () => {
+            cookieMessage.classList.add('hidden');
+            testCookiesBtn.disabled = true;
+            testCookiesBtn.innerHTML = '<i class="fas fa-spinner mr-2"></i>测试中...';
+            try {
+                const [cookieData, testData] = await Promise.all([
+                    adminFetch('/api/admin/cookies'),
+                    adminFetch('/api/admin/cookies/test', { method: 'POST', body: JSON.stringify({}) })
+                ]);
+                renderCookies(cookieData, testData.results || []);
+                showMessage(cookieMessage, '检测完成', true);
+            } catch (error) {
+                showMessage(cookieMessage, error.message);
+            } finally {
+                testCookiesBtn.disabled = false;
+                testCookiesBtn.innerHTML = '<i class="fas fa-vial mr-2"></i>一键测试';
+            }
+        });
+
+        refreshBtn.addEventListener('click', () => loadAll().catch((error) => {
+            summaryText.textContent = error.message;
+        }));
+
+        logoutBtn.addEventListener('click', () => {
+            localStorage.removeItem(ADMIN_STORAGE_KEY);
+            adminToken = '';
+            adminTokenInput.value = '';
+            adminModal.classList.remove('hidden');
+        });
+
+        if (adminToken) {
+            adminTokenInput.value = adminToken;
+            loadAll().catch(() => adminModal.classList.remove('hidden'));
+        }
+    </script>
+</body>
+</html>

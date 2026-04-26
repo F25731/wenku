@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+downloads/
+data/
+tokens.db
+cookies.json
+cookie.txt
+admin_token.txt
+*.log
+*.zip

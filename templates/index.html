@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>百度文库 PDF 转换器</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body {
+            min-height: 100vh;
+            background:
+                radial-gradient(circle at top left, rgba(255, 255, 255, 0.24), transparent 32rem),
+                linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .glass-card {
+            background: rgba(255, 255, 255, 0.9);
+            backdrop-filter: blur(14px);
+            border: 1px solid rgba(255, 255, 255, 0.42);
+            box-shadow: 0 18px 60px rgba(31, 38, 135, 0.28);
+        }
+        .detail-panel {
+            background: linear-gradient(180deg, rgba(79, 70, 229, 0.08), rgba(255, 255, 255, 0.72));
+            border: 1px solid rgba(99, 102, 241, 0.18);
+        }
+        .status-stream {
+            height: 306px;
+            overflow-y: auto;
+            scroll-behavior: smooth;
+        }
+        .status-stream::-webkit-scrollbar {
+            width: 7px;
+        }
+        .status-stream::-webkit-scrollbar-thumb {
+            background: rgba(129, 140, 248, 0.48);
+            border-radius: 999px;
+        }
+        .loader {
+            border: 4px solid rgba(255, 255, 255, 0.45);
+            border-top: 4px solid #ffffff;
+            border-radius: 50%;
+            width: 22px;
+            height: 22px;
+            animation: spin 1s linear infinite;
+        }
+        .pulse-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 999px;
+            background: #818cf8;
+            box-shadow: 0 0 0 rgba(129, 140, 248, 0.7);
+            animation: pulse 1.8s infinite;
+        }
+        .token-mask {
+            background:
+                radial-gradient(circle at 18% 18%, rgba(255,255,255,0.26), transparent 26rem),
+                rgba(15, 23, 42, 0.52);
+            backdrop-filter: blur(12px);
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(129, 140, 248, 0.7); }
+            70% { box-shadow: 0 0 0 9px rgba(129, 140, 248, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(129, 140, 248, 0); }
+        }
+    </style>
+</head>
+<body class="flex items-center justify-center p-4 antialiased text-gray-800">
+    <main class="glass-card w-full max-w-5xl rounded-2xl p-6 md:p-8 transition-all">
+        <header class="mb-7 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+            <div>
+                <div class="mb-2 inline-flex items-center rounded-full bg-indigo-50 px-3 py-1 text-xs font-semibold text-indigo-700">
+                    <i class="fas fa-shield-alt mr-2"></i>
+                    本地转换 · 自动读取 cookie.txt
+                </div>
+                <h1 class="text-3xl font-bold text-gray-900">
+                    <i class="fas fa-file-pdf text-indigo-600 mr-2"></i>百度文库 PDF 转换器
+                </h1>
+                <p class="mt-2 text-sm text-gray-500">输入文档链接，程序会自动完成文档整理并生成 PDF。</p>
+            </div>
+            <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <div id="tokenBadge" class="inline-flex items-center rounded-lg bg-amber-50 px-3 py-2 text-sm font-medium text-amber-700">
+                    <i class="fas fa-key mr-2"></i>
+                    等待 Token
+                </div>
+                <div id="cookieBadge" class="inline-flex items-center rounded-lg px-3 py-2 text-sm font-medium {{ 'bg-green-50 text-green-700' if has_cookie else 'bg-amber-50 text-amber-700' }}">
+                    <i class="fas {{ 'fa-check-circle' if has_cookie else 'fa-circle-exclamation' }} mr-2"></i>
+                    {{ '已检测到 cookie.txt' if has_cookie else '未检测到 cookie.txt' }}
+                </div>
+            </div>
+        </header>
+
+        <section class="grid gap-6 lg:grid-cols-[1fr_1.15fr]">
+            <form id="convertForm" class="space-y-5">
+                <div>
+                    <label class="mb-2 block text-sm font-semibold text-gray-700" for="url">文库链接</label>
+                    <input
+                        type="url"
+                        id="url"
+                        required
+                        placeholder="https://wenku.baidu.com/view/..."
+                        class="w-full rounded-xl border border-gray-300 bg-white/90 px-4 py-3 outline-none transition-shadow focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500"
+                    >
+                </div>
+
+                <details class="rounded-xl border border-gray-200 bg-white/70 p-4">
+                    <summary class="cursor-pointer text-sm font-semibold text-gray-700">临时覆盖 Cookie</summary>
+                    <textarea
+                        id="cookie"
+                        rows="4"
+                        placeholder="通常不用填写。只有想临时换账号时，再把 Cookie 粘贴到这里。"
+                        class="mt-3 w-full rounded-lg border border-gray-300 px-3 py-2 font-mono text-sm outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500"
+                    ></textarea>
+                </details>
+
+                <button
+                    type="submit"
+                    id="submitBtn"
+                    class="flex w-full items-center justify-center rounded-xl bg-indigo-600 px-6 py-3 font-semibold text-white shadow-lg shadow-indigo-600/25 transition-colors hover:bg-indigo-700 disabled:cursor-not-allowed disabled:bg-indigo-400"
+                    disabled
+                >
+                    <span id="btnText"><i class="fas fa-lock mr-2"></i>请先验证 Token</span>
+                    <div id="loader" class="loader ml-3 hidden"></div>
+                </button>
+
+                <div id="resultBox" class="hidden rounded-xl p-4 text-sm"></div>
+            </form>
+
+            <aside class="detail-panel rounded-2xl p-5">
+                <div class="mb-4 flex items-center justify-between">
+                    <div>
+                        <h2 class="text-lg font-bold text-gray-900">转换详情</h2>
+                        <p class="mt-1 text-xs text-gray-500">仅展示当前进度，完成后自动给出下载入口。</p>
+                    </div>
+                    <span id="statePill" class="inline-flex items-center gap-2 rounded-full bg-white px-3 py-1 text-xs font-semibold text-indigo-700 shadow-sm">
+                        <span class="h-2 w-2 rounded-full bg-indigo-400"></span>
+                        待命
+                    </span>
+                </div>
+
+                <div class="mb-4 grid grid-cols-3 gap-3">
+                    <div class="rounded-xl bg-white/75 p-3 shadow-sm">
+                        <div class="text-xs text-gray-400">方案</div>
+                        <div id="modeValue" class="mt-1 truncate text-sm font-bold text-gray-800">自动识别</div>
+                    </div>
+                    <div class="rounded-xl bg-white/75 p-3 shadow-sm">
+                        <div class="text-xs text-gray-400">页数</div>
+                        <div id="pagesValue" class="mt-1 truncate text-sm font-bold text-gray-800">--</div>
+                    </div>
+                    <div class="rounded-xl bg-white/75 p-3 shadow-sm">
+                        <div class="text-xs text-gray-400">用时</div>
+                        <div id="timeValue" class="mt-1 truncate text-sm font-bold text-gray-800">--</div>
+                    </div>
+                </div>
+
+                <div id="statusStream" class="status-stream rounded-xl bg-gray-950 p-4 font-mono text-xs leading-6 text-indigo-50 shadow-inner">
+                    <div class="flex gap-3 text-indigo-200">
+                        <span class="w-16 shrink-0 text-indigo-400">ready</span>
+                        <span>等待文库链接。</span>
+                    </div>
+                    <div class="flex gap-3 text-indigo-200">
+                        <span class="w-16 shrink-0 text-indigo-400">access</span>
+                        <span>Token 验证通过后即可开始。</span>
+                    </div>
+                    <div class="flex gap-3 text-indigo-200">
+                        <span class="w-16 shrink-0 text-indigo-400">output</span>
+                        <span>完成后文件会保存到 downloads 文件夹。</span>
+                    </div>
+                </div>
+            </aside>
+        </section>
+    </main>
+
+    <div id="tokenModal" class="token-mask fixed inset-0 z-50 flex items-center justify-center p-4">
+        <section class="glass-card w-full max-w-md rounded-2xl p-6">
+            <div class="mb-5 flex items-start justify-between gap-4">
+                <div>
+                    <div class="mb-2 inline-flex items-center rounded-full bg-indigo-50 px-3 py-1 text-xs font-semibold text-indigo-700">
+                        <i class="fas fa-key mr-2"></i>访问验证
+                    </div>
+                    <h2 class="text-2xl font-bold text-gray-900">输入使用 Token</h2>
+                    <p class="mt-2 text-sm text-gray-500">验证通过后，本机浏览器会记住本次授权。</p>
+                </div>
+                <a href="/admin" target="_blank" class="rounded-lg bg-white px-3 py-2 text-xs font-semibold text-indigo-700 shadow-sm hover:bg-indigo-50">
+                    后台
+                </a>
+            </div>
+
+            <form id="tokenForm" class="space-y-4">
+                <input
+                    id="accessToken"
+                    type="password"
+                    autocomplete="off"
+                    placeholder="粘贴 Token"
+                    class="w-full rounded-xl border border-gray-300 bg-white/90 px-4 py-3 font-mono text-sm outline-none transition-shadow focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500"
+                >
+                <button
+                    id="tokenSubmit"
+                    type="submit"
+                    class="flex w-full items-center justify-center rounded-xl bg-indigo-600 px-6 py-3 font-semibold text-white shadow-lg shadow-indigo-600/25 transition-colors hover:bg-indigo-700 disabled:cursor-not-allowed disabled:bg-indigo-400"
+                >
+                    <i class="fas fa-unlock mr-2"></i>进入
+                </button>
+                <div id="tokenMessage" class="hidden rounded-lg p-3 text-sm"></div>
+            </form>
+        </section>
+    </div>
+
+    <script>
+        const form = document.getElementById('convertForm');
+        const submitBtn = document.getElementById('submitBtn');
+        const btnText = document.getElementById('btnText');
+        const loader = document.getElementById('loader');
+        const resultBox = document.getElementById('resultBox');
+        const statusStream = document.getElementById('statusStream');
+        const statePill = document.getElementById('statePill');
+        const modeValue = document.getElementById('modeValue');
+        const pagesValue = document.getElementById('pagesValue');
+        const timeValue = document.getElementById('timeValue');
+        const tokenBadge = document.getElementById('tokenBadge');
+        const tokenModal = document.getElementById('tokenModal');
+        const tokenForm = document.getElementById('tokenForm');
+        const accessTokenInput = document.getElementById('accessToken');
+        const tokenSubmit = document.getElementById('tokenSubmit');
+        const tokenMessage = document.getElementById('tokenMessage');
+
+        const TOKEN_STORAGE_KEY = 'wenku_access_token';
+        let accessToken = '';
+        let pollTimer = null;
+        let lastLogId = 0;
+
+        function resetStream() {
+            statusStream.innerHTML = '';
+            lastLogId = 0;
+        }
+
+        function levelClass(level) {
+            if (level === 'ok') return 'text-green-300';
+            if (level === 'error') return 'text-red-300';
+            return 'text-indigo-100';
+        }
+
+        function appendLog(log) {
+            const row = document.createElement('div');
+            row.className = `mb-1.5 flex gap-3 ${levelClass(log.level)}`;
+            row.innerHTML = `
+                <span class="w-16 shrink-0 text-indigo-400">${log.time || '--:--:--'}</span>
+                <span class="min-w-0 flex-1 break-words">${escapeHtml(log.message)}</span>
+            `;
+            statusStream.appendChild(row);
+            statusStream.scrollTop = statusStream.scrollHeight;
+        }
+
+        function escapeHtml(value) {
+            return String(value)
+                .replaceAll('&', '&amp;')
+                .replaceAll('<', '&lt;')
+                .replaceAll('>', '&gt;')
+                .replaceAll('"', '&quot;')
+                .replaceAll("'", '&#039;');
+        }
+
+        function setState(label, tone) {
+            const colors = {
+                idle: ['bg-white', 'text-indigo-700', 'h-2 w-2 rounded-full bg-indigo-400'],
+                running: ['bg-indigo-600', 'text-white', 'pulse-dot'],
+                done: ['bg-green-600', 'text-white', 'h-2 w-2 rounded-full bg-green-200'],
+                error: ['bg-red-600', 'text-white', 'h-2 w-2 rounded-full bg-red-200']
+            };
+            const [bg, text, dot] = colors[tone] || colors.idle;
+            statePill.className = `inline-flex items-center gap-2 rounded-full ${bg} px-3 py-1 text-xs font-semibold ${text} shadow-sm`;
+            statePill.innerHTML = `<span class="${dot}"></span>${label}`;
+        }
+
+        function setRunning(isRunning) {
+            submitBtn.disabled = isRunning || !accessToken;
+            loader.classList.toggle('hidden', !isRunning);
+            btnText.innerHTML = isRunning
+                ? '<i class="fas fa-spinner mr-2"></i>正在处理，请稍等...'
+                : '<i class="fas fa-rocket mr-2"></i>开始转换';
+        }
+
+        function setTokenMessage(message, ok = false) {
+            tokenMessage.className = ok
+                ? 'rounded-lg bg-green-50 p-3 text-sm text-green-700'
+                : 'rounded-lg bg-red-50 p-3 text-sm text-red-600';
+            tokenMessage.textContent = message;
+            tokenMessage.classList.remove('hidden');
+        }
+
+        function setTokenReady(tokenData) {
+            tokenModal.classList.add('hidden');
+            submitBtn.disabled = false;
+            btnText.innerHTML = '<i class="fas fa-rocket mr-2"></i>开始转换';
+            tokenBadge.className = 'inline-flex items-center rounded-lg bg-green-50 px-3 py-2 text-sm font-medium text-green-700';
+            tokenBadge.innerHTML = `<i class="fas fa-check-circle mr-2"></i>Token 可用${tokenData?.expires_at_text ? ' · ' + escapeHtml(tokenData.expires_at_text) : ''}`;
+        }
+
+        async function verifyToken(token, quiet = false) {
+            const response = await fetch('/api/token/verify', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ token })
+            });
+            const data = await response.json();
+            if (!response.ok) {
+                if (!quiet) setTokenMessage(data.message || 'Token 验证失败');
+                return false;
+            }
+            accessToken = token;
+            localStorage.setItem(TOKEN_STORAGE_KEY, token);
+            setTokenReady(data.token);
+            return true;
+        }
+
+        async function bootstrapToken() {
+            const params = new URLSearchParams(window.location.search);
+            const tokenFromUrl = params.get('token') || '';
+            const savedToken = localStorage.getItem(TOKEN_STORAGE_KEY) || '';
+            const candidate = tokenFromUrl.trim() || savedToken.trim();
+            if (!candidate) return;
+            accessTokenInput.value = candidate;
+            const ok = await verifyToken(candidate, true);
+            if (ok && tokenFromUrl) {
+                window.history.replaceState({}, document.title, window.location.pathname);
+            }
+        }
+
+        function renderSuccess(data) {
+            modeValue.textContent = friendlyMode(data.mode);
+            pagesValue.textContent = `${data.pages}`;
+            timeValue.textContent = `${data.seconds}s`;
+            resultBox.className = 'rounded-xl bg-green-50 p-4 text-sm text-green-700';
+            resultBox.innerHTML = `
+                <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                        <div class="font-bold"><i class="fas fa-check-circle mr-2"></i>${escapeHtml(data.message)}</div>
+                        <div class="mt-1 text-xs text-green-600">${escapeHtml(data.filename)}</div>
+                    </div>
+                    <a href="${data.download_url}?token=${encodeURIComponent(accessToken)}" target="_blank"
+                       class="inline-flex items-center justify-center rounded-full bg-green-600 px-5 py-2 font-semibold text-white transition-colors hover:bg-green-700">
+                        <i class="fas fa-download mr-2"></i>下载 PDF
+                    </a>
+                </div>
+            `;
+            resultBox.classList.remove('hidden');
+        }
+
+        function friendlyMode(mode) {
+            const map = {
+                'pdf-full-page-png': '高清文档',
+                'ppt-page-images': '演示文档',
+                'excel-page-images': '表格文档',
+                'html-render-screenshot-masked': '智能整理'
+            };
+            return map[mode] || '智能整理';
+        }
+
+        function renderError(message) {
+            resultBox.className = 'rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-600';
+            resultBox.innerHTML = `<i class="fas fa-exclamation-triangle mr-2"></i><strong>处理失败：</strong>${escapeHtml(message)}`;
+            resultBox.classList.remove('hidden');
+        }
+
+        async function pollJob(jobId) {
+            const response = await fetch(`/api/job/${jobId}?token=${encodeURIComponent(accessToken)}&scope=web`);
+            const data = await response.json();
+            if (!response.ok) {
+                throw new Error(data.error || '无法读取任务状态');
+            }
+
+            for (const log of data.logs || []) {
+                if (log.id > lastLogId) {
+                    appendLog(log);
+                    lastLogId = log.id;
+                }
+            }
+
+            if (data.status === 'done') {
+                clearTimeout(pollTimer);
+                setRunning(false);
+                setState('完成', 'done');
+                renderSuccess(data.result);
+                return;
+            }
+
+            if (data.status === 'error') {
+                clearTimeout(pollTimer);
+                setRunning(false);
+                setState('失败', 'error');
+                renderError(data.error || '未知错误');
+                return;
+            }
+
+            pollTimer = setTimeout(() => pollJob(jobId).catch(handlePollError), 900);
+        }
+
+        function handlePollError(error) {
+            clearTimeout(pollTimer);
+            setRunning(false);
+            setState('失败', 'error');
+            appendLog({ time: new Date().toLocaleTimeString('zh-CN', { hour12: false }), level: 'error', message: error.message });
+            renderError(error.message);
+        }
+
+        tokenForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const token = accessTokenInput.value.trim();
+            tokenSubmit.disabled = true;
+            tokenSubmit.innerHTML = '<i class="fas fa-spinner mr-2"></i>验证中...';
+            tokenMessage.classList.add('hidden');
+            try {
+                await verifyToken(token);
+            } catch (error) {
+                setTokenMessage(error.message || 'Token 验证失败');
+            } finally {
+                tokenSubmit.disabled = false;
+                tokenSubmit.innerHTML = '<i class="fas fa-unlock mr-2"></i>进入';
+            }
+        });
+
+        form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            clearTimeout(pollTimer);
+
+            const url = document.getElementById('url').value.trim();
+            const cookie = document.getElementById('cookie').value.trim();
+
+            resultBox.classList.add('hidden');
+            modeValue.textContent = '自动识别';
+            pagesValue.textContent = '--';
+            timeValue.textContent = '--';
+            resetStream();
+            setRunning(true);
+            setState('处理中', 'running');
+
+            try {
+                const response = await fetch('/api/convert', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url, cookie, token: accessToken, scope: 'web' })
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    if (response.status === 403) {
+                        accessToken = '';
+                        localStorage.removeItem(TOKEN_STORAGE_KEY);
+                        tokenModal.classList.remove('hidden');
+                        submitBtn.disabled = true;
+                    }
+                    throw new Error(data.error || '任务创建失败');
+                }
+                pollJob(data.job_id).catch(handlePollError);
+            } catch (error) {
+                setRunning(false);
+                setState('失败', 'error');
+                appendLog({ time: new Date().toLocaleTimeString('zh-CN', { hour12: false }), level: 'error', message: error.message });
+                renderError(error.message);
+            }
+        });
+
+        bootstrapToken().catch(() => {});
+    </script>
+</body>
+</html>
