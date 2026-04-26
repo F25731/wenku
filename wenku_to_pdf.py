@@ -64,9 +64,15 @@ def emit_progress(progress, message):
 def browser_launch_options(profile_dir, scale):
     options = {
         "user_data_dir": str(profile_dir),
+        **browser_context_options(scale),
+        **browser_process_launch_options(),
+    }
+    return options
+
+
+def browser_process_launch_options():
+    options = {
         "headless": True,
-        "viewport": {"width": 1440, "height": 1800},
-        "device_scale_factor": scale,
         "args": [
             "--no-first-run",
             "--no-default-browser-check",
@@ -76,6 +82,13 @@ def browser_launch_options(profile_dir, scale):
     if DEFAULT_BROWSER_CHANNEL:
         options["channel"] = DEFAULT_BROWSER_CHANNEL
     return options
+
+
+def browser_context_options(scale):
+    return {
+        "viewport": {"width": 1440, "height": 1800},
+        "device_scale_factor": scale,
+    }
 
 
 def parse_cookie_header(cookie_header):
@@ -1067,6 +1080,164 @@ async def process_html_screenshots(
     return {"mode": "html-render-screenshot-masked", "pages": page_count}
 
 
+async def convert_in_context(browser_context, url, cookie_text, temp_dir, output_dir, progress=None):
+    page = browser_context.pages[0] if browser_context.pages else await browser_context.new_page()
+    await browser_context.add_cookies(parse_cookie_header(cookie_text))
+
+    emit_progress(progress, "正在进入文档空间")
+    await page.goto(url_with_query_params(url, edtMode=2), wait_until="domcontentloaded", timeout=60000)
+    await safe_wait(page)
+    emit_progress(progress, "正在读取文档信息")
+
+    html = await page.content()
+    data = extract_page_data(html)
+    if not data:
+        raise RuntimeError("Cannot find pageData in document page")
+
+    title = title_from_page_data(data, await page.title())
+    _, _, file_type, tpl_key, page_count = reader_info(data)
+    output_pdf = output_dir / f"{title}.pdf"
+
+    emit_progress(progress, f"文档名称：{title}")
+    emit_progress(progress, f"文档页数：{page_count or 'unknown'}")
+
+    if file_type in {"ppt", "pptx"} or tpl_key == "new_view":
+        emit_progress(progress, "已选择最佳处理方案")
+        result = await process_ppt(browser_context, page, page_count, temp_dir, output_pdf, data, progress=progress)
+    elif file_type == "pdf":
+        emit_progress(progress, "已选择最佳处理方案")
+        try:
+            result = await process_structured_document(
+                browser_context,
+                page,
+                page_count,
+                temp_dir,
+                output_pdf,
+                data,
+                file_type,
+                progress=progress,
+                source_url=url,
+            )
+        except StructuredResourceNotUsable:
+            emit_progress(progress, "正在切换备用处理方案")
+            try:
+                result = await process_pdf_page_images(browser_context, page, page_count, temp_dir, output_pdf, data, progress=progress)
+            except PdfDirectImageNotUsable:
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                await safe_wait(page)
+                await exit_editor_mode_if_needed(page, progress=progress)
+                result = await process_html_screenshots(
+                    page,
+                    page_count,
+                    temp_dir,
+                    output_pdf,
+                    clean_watermark=True,
+                    progress=progress,
+                    require_nonblank_pages=True,
+                    hide_overlays=True,
+                )
+    elif file_type in {"excel", "xls", "xlsx"}:
+        emit_progress(progress, "已选择最佳处理方案")
+        try:
+            result = await process_structured_document(
+                browser_context,
+                page,
+                page_count,
+                temp_dir,
+                output_pdf,
+                data,
+                file_type,
+                progress=progress,
+                source_url=url,
+            )
+        except StructuredResourceNotUsable:
+            emit_progress(progress, "正在切换备用处理方案")
+            try:
+                result = await process_excel_page_images(browser_context, page, page_count, temp_dir, output_pdf, data, progress=progress)
+            except ExcelDirectImageNotUsable:
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                await safe_wait(page)
+                await exit_editor_mode_if_needed(page, progress=progress)
+                result = await process_html_screenshots(
+                    page,
+                    page_count,
+                    temp_dir,
+                    output_pdf,
+                    clean_watermark=True,
+                    progress=progress,
+                    require_nonblank_pages=True,
+                    hide_overlays=True,
+                )
+    elif file_type in {"word", "doc", "docx"}:
+        emit_progress(progress, "已选择最佳处理方案")
+        try:
+            result = await process_structured_document(
+                browser_context,
+                page,
+                page_count,
+                temp_dir,
+                output_pdf,
+                data,
+                file_type,
+                progress=progress,
+                source_url=url,
+            )
+        except StructuredResourceNotUsable:
+            emit_progress(progress, "正在切换备用处理方案")
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await safe_wait(page)
+            await exit_editor_mode_if_needed(page, progress=progress)
+            result = await process_html_screenshots(
+                page,
+                page_count,
+                temp_dir,
+                output_pdf,
+                clean_watermark=True,
+                progress=progress,
+                require_nonblank_pages=False,
+                hide_overlays=False,
+            )
+    else:
+        emit_progress(progress, "已选择最佳处理方案")
+        await exit_editor_mode_if_needed(page, progress=progress)
+        result = await process_html_screenshots(
+            page,
+            page_count,
+            temp_dir,
+            output_pdf,
+            clean_watermark=True,
+            progress=progress,
+            require_nonblank_pages=False,
+            hide_overlays=False,
+        )
+
+    emit_progress(progress, f"最终文件已生成：{output_pdf.name}")
+    return {"output": str(output_pdf), **result}
+
+
+async def convert_with_browser(browser, url, cookie_text, output_dir, temp_root=None, keep_temp=False, scale=2.0, progress=None):
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    temp_parent = Path(temp_root).resolve() if temp_root else None
+    temp_dir = Path(tempfile.mkdtemp(prefix="wenku_to_pdf_", dir=str(temp_parent) if temp_parent else None))
+    browser_context = None
+    try:
+        browser_context = await browser.new_context(**browser_context_options(scale))
+        return await convert_in_context(browser_context, url, cookie_text, temp_dir, output_dir, progress=progress)
+    finally:
+        if browser_context:
+            try:
+                await browser_context.close()
+            except Exception:
+                pass
+        if keep_temp:
+            emit_progress(progress, f"保留诊断目录：{temp_dir}")
+        else:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            emit_progress(progress, "运行环境已整理完成")
+
+
 async def convert(url, cookie_text, output_dir, temp_root=None, keep_temp=False, scale=2.0, progress=None):
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1078,139 +1249,10 @@ async def convert(url, cookie_text, output_dir, temp_root=None, keep_temp=False,
     try:
         async with async_playwright() as p:
             browser_context = await p.chromium.launch_persistent_context(**browser_launch_options(profile_dir, scale))
-            page = browser_context.pages[0] if browser_context.pages else await browser_context.new_page()
-            await browser_context.add_cookies(parse_cookie_header(cookie_text))
-
-            emit_progress(progress, "正在进入文档空间")
-            await page.goto(url_with_query_params(url, edtMode=2), wait_until="domcontentloaded", timeout=60000)
-            await safe_wait(page)
-            emit_progress(progress, "正在读取文档信息")
-
-            html = await page.content()
-            data = extract_page_data(html)
-            if not data:
-                raise RuntimeError("Cannot find pageData in document page")
-
-            title = title_from_page_data(data, await page.title())
-            _, _, file_type, tpl_key, page_count = reader_info(data)
-            output_pdf = output_dir / f"{title}.pdf"
-
-            emit_progress(progress, f"文档名称：{title}")
-            emit_progress(progress, f"文档页数：{page_count or 'unknown'}")
-
-            if file_type in {"ppt", "pptx"} or tpl_key == "new_view":
-                emit_progress(progress, "已选择最佳处理方案")
-                result = await process_ppt(browser_context, page, page_count, temp_dir, output_pdf, data, progress=progress)
-            elif file_type == "pdf":
-                emit_progress(progress, "已选择最佳处理方案")
-                try:
-                    result = await process_structured_document(
-                        browser_context,
-                        page,
-                        page_count,
-                        temp_dir,
-                        output_pdf,
-                        data,
-                        file_type,
-                        progress=progress,
-                        source_url=url,
-                    )
-                except StructuredResourceNotUsable:
-                    emit_progress(progress, "正在切换备用处理方案")
-                    try:
-                        result = await process_pdf_page_images(browser_context, page, page_count, temp_dir, output_pdf, data, progress=progress)
-                    except PdfDirectImageNotUsable:
-                        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                        await safe_wait(page)
-                        await exit_editor_mode_if_needed(page, progress=progress)
-                        result = await process_html_screenshots(
-                            page,
-                            page_count,
-                            temp_dir,
-                            output_pdf,
-                            clean_watermark=True,
-                            progress=progress,
-                            require_nonblank_pages=True,
-                            hide_overlays=True,
-                        )
-            elif file_type in {"excel", "xls", "xlsx"}:
-                emit_progress(progress, "已选择最佳处理方案")
-                try:
-                    result = await process_structured_document(
-                        browser_context,
-                        page,
-                        page_count,
-                        temp_dir,
-                        output_pdf,
-                        data,
-                        file_type,
-                        progress=progress,
-                        source_url=url,
-                    )
-                except StructuredResourceNotUsable:
-                    emit_progress(progress, "正在切换备用处理方案")
-                    try:
-                        result = await process_excel_page_images(browser_context, page, page_count, temp_dir, output_pdf, data, progress=progress)
-                    except ExcelDirectImageNotUsable:
-                        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                        await safe_wait(page)
-                        await exit_editor_mode_if_needed(page, progress=progress)
-                        result = await process_html_screenshots(
-                            page,
-                            page_count,
-                            temp_dir,
-                            output_pdf,
-                            clean_watermark=True,
-                            progress=progress,
-                            require_nonblank_pages=True,
-                            hide_overlays=True,
-                        )
-            elif file_type in {"word", "doc", "docx"}:
-                emit_progress(progress, "已选择最佳处理方案")
-                try:
-                    result = await process_structured_document(
-                        browser_context,
-                        page,
-                        page_count,
-                        temp_dir,
-                        output_pdf,
-                        data,
-                        file_type,
-                        progress=progress,
-                        source_url=url,
-                    )
-                except StructuredResourceNotUsable:
-                    emit_progress(progress, "正在切换备用处理方案")
-                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    await safe_wait(page)
-                    await exit_editor_mode_if_needed(page, progress=progress)
-                    result = await process_html_screenshots(
-                        page,
-                        page_count,
-                        temp_dir,
-                        output_pdf,
-                        clean_watermark=True,
-                        progress=progress,
-                        require_nonblank_pages=False,
-                        hide_overlays=False,
-                    )
-            else:
-                emit_progress(progress, "已选择最佳处理方案")
-                await exit_editor_mode_if_needed(page, progress=progress)
-                result = await process_html_screenshots(
-                    page,
-                    page_count,
-                    temp_dir,
-                    output_pdf,
-                    clean_watermark=True,
-                    progress=progress,
-                    require_nonblank_pages=False,
-                    hide_overlays=False,
-                )
-
-            await browser_context.close()
-            emit_progress(progress, f"最终文件已生成：{output_pdf.name}")
-            return {"output": str(output_pdf), **result}
+            try:
+                return await convert_in_context(browser_context, url, cookie_text, temp_dir, output_dir, progress=progress)
+            finally:
+                await browser_context.close()
     finally:
         if keep_temp:
             emit_progress(progress, f"保留诊断目录：{temp_dir}")

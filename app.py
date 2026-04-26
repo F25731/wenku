@@ -13,7 +13,9 @@ import webbrowser
 
 from flask import Flask, jsonify, render_template, request, send_from_directory
 
-from wenku_to_pdf import convert
+from playwright.async_api import async_playwright
+
+from wenku_to_pdf import browser_process_launch_options, convert, convert_with_browser
 
 
 app = Flask(__name__)
@@ -30,6 +32,7 @@ MAX_COOKIE_POOL_SIZE = 10
 MAX_QUEUE_WORKERS = 2
 DOWNLOAD_TTL_SECONDS = int(os.environ.get("WENKU_DOWNLOAD_TTL_SECONDS", "3600"))
 DOWNLOAD_CLEANUP_INTERVAL_SECONDS = int(os.environ.get("WENKU_DOWNLOAD_CLEANUP_INTERVAL_SECONDS", "300"))
+BROWSER_RESTART_AFTER_JOBS = int(os.environ.get("WENKU_BROWSER_RESTART_AFTER_JOBS", "20"))
 COOKIE_TEST_URL = os.environ.get("WENKU_COOKIE_TEST_URL", "https://wenku.baidu.com/")
 CORS_ORIGINS = [
     item.strip()
@@ -650,7 +653,56 @@ def get_job_snapshot(job_id):
         return snapshot
 
 
-def run_convert_job(job_id, url, cookie, cookie_slot=None, cookie_total=None):
+class WorkerBrowserRuntime:
+    def __init__(self, worker_id, restart_after_jobs):
+        self.worker_id = worker_id
+        self.restart_after_jobs = max(1, restart_after_jobs)
+        self.loop = asyncio.new_event_loop()
+        self.playwright = None
+        self.browser = None
+        self.completed_jobs = 0
+
+    async def ensure_browser(self):
+        if self.browser and self.browser.is_connected():
+            return self.browser
+        self.playwright = await async_playwright().start()
+        self.browser = await self.playwright.chromium.launch(**browser_process_launch_options())
+        self.completed_jobs = 0
+        return self.browser
+
+    async def restart_browser(self):
+        if self.browser:
+            try:
+                await self.browser.close()
+            except Exception:
+                pass
+        self.browser = None
+        if self.playwright:
+            try:
+                await self.playwright.stop()
+            except Exception:
+                pass
+        self.playwright = None
+        self.completed_jobs = 0
+
+    async def convert(self, **kwargs):
+        browser = await self.ensure_browser()
+        try:
+            result = await convert_with_browser(browser=browser, **kwargs)
+            self.completed_jobs += 1
+            if self.completed_jobs >= self.restart_after_jobs:
+                await self.restart_browser()
+            return result
+        except Exception:
+            await self.restart_browser()
+            raise
+
+    def run_convert(self, **kwargs):
+        asyncio.set_event_loop(self.loop)
+        return self.loop.run_until_complete(self.convert(**kwargs))
+
+
+def run_convert_job(job_id, url, cookie, cookie_slot=None, cookie_total=None, browser_runtime=None):
     started_at = time.perf_counter()
     update_job(job_id, status="running")
     if cookie_slot and cookie_total:
@@ -661,14 +713,18 @@ def run_convert_job(job_id, url, cookie, cookie_slot=None, cookie_total=None):
         add_job_log(job_id, message)
 
     try:
-        result = asyncio.run(convert(
-            url=url,
-            cookie_text=cookie,
-            output_dir=DOWNLOAD_DIR,
-            keep_temp=False,
-            scale=2.0,
-            progress=progress,
-        ))
+        convert_kwargs = {
+            "url": url,
+            "cookie_text": cookie,
+            "output_dir": DOWNLOAD_DIR,
+            "keep_temp": False,
+            "scale": 2.0,
+            "progress": progress,
+        }
+        if browser_runtime:
+            result = browser_runtime.run_convert(**convert_kwargs)
+        else:
+            result = asyncio.run(convert(**convert_kwargs))
         filename = os.path.basename(result["output"])
         elapsed = round(time.perf_counter() - started_at, 1)
         payload = {
@@ -689,6 +745,7 @@ def run_convert_job(job_id, url, cookie, cookie_slot=None, cookie_total=None):
 
 
 def queued_convert_worker(worker_id):
+    browser_runtime = WorkerBrowserRuntime(worker_id, BROWSER_RESTART_AFTER_JOBS)
     while True:
         job_id, url, override_cookie = job_queue.get()
         has_waiting_marker = False
@@ -715,7 +772,7 @@ def queued_convert_worker(worker_id):
                     raise RuntimeError("没有找到 Cookie，请先把 Cookie 写入 cookie.txt")
 
                 add_job_log(job_id, f"进入处理通道 {active_count}/{limit}", "ok")
-                run_convert_job(job_id, url, cookie, cookie_slot, cookie_total)
+                run_convert_job(job_id, url, cookie, cookie_slot, cookie_total, browser_runtime=browser_runtime)
             finally:
                 release_job_slot()
         except Exception as exc:
@@ -762,6 +819,7 @@ def api_status():
         "running_jobs": running_jobs,
         "queued_jobs": queued_job_count(),
         "download_ttl_seconds": DOWNLOAD_TTL_SECONDS,
+        "browser_restart_after_jobs": BROWSER_RESTART_AFTER_JOBS,
         "download_dir": DOWNLOAD_DIR,
         "token_required": True,
     })

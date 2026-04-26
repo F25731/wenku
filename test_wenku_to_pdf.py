@@ -8,7 +8,9 @@ from wenku_to_pdf import (
     PdfDirectImageNotUsable,
     READER_OVERLAY_HIDE_CSS,
     TOP_MASK_FIRST_PAGE,
+    browser_context_options,
     browser_launch_options,
+    browser_process_launch_options,
     excel_direct_image_looks_complete,
     excel_page_image_items,
     full_page_png_looks_complete,
@@ -79,6 +81,20 @@ class BrowserLaunchOptionsTest(unittest.TestCase):
         self.assertNotIn("channel", options)
         self.assertEqual(options["user_data_dir"], "profile")
         self.assertEqual(options["device_scale_factor"], 2.0)
+
+    def test_browser_context_options_keep_task_state_isolated(self):
+        options = browser_context_options(2.0)
+
+        self.assertEqual(options["viewport"], {"width": 1440, "height": 1800})
+        self.assertEqual(options["device_scale_factor"], 2.0)
+        self.assertNotIn("user_data_dir", options)
+
+    def test_browser_process_launch_options_do_not_include_context_fields(self):
+        options = browser_process_launch_options()
+
+        self.assertTrue(options["headless"])
+        self.assertIn("--no-first-run", options["args"])
+        self.assertNotIn("viewport", options)
 
 
 class PdfFallbackTest(unittest.TestCase):
