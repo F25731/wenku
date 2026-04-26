@@ -21,6 +21,7 @@ from wenku_to_pdf import (
     page_image_ready,
     page_index_from_font_url,
     page_index_from_resource_url,
+    structured_page_needs_font,
     url_with_query_params,
 )
 
@@ -103,6 +104,18 @@ class ResponseTextDecodeTest(unittest.TestCase):
         raw = "第36页结构化资源".encode("gb18030")
 
         self.assertEqual(decode_response_text(raw, ""), "第36页结构化资源")
+
+
+class StructuredPageFontRequirementTest(unittest.TestCase):
+    def test_pic_only_page_does_not_need_font_resource(self):
+        page_data = {"body": [{"t": "pic", "c": {"ix": 0, "iy": 0, "iw": 959, "ih": 1356}}]}
+
+        self.assertFalse(structured_page_needs_font(page_data))
+
+    def test_word_page_needs_font_resource(self):
+        page_data = {"body": [{"t": "word", "c": "hello"}]}
+
+        self.assertTrue(structured_page_needs_font(page_data))
 
 
 class PdfFallbackTest(unittest.TestCase):

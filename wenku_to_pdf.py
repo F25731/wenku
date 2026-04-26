@@ -430,6 +430,13 @@ def json_callback_body(text):
     return match.group(1) if match else text
 
 
+def structured_page_needs_font(page_data):
+    for item in page_data.get("body") or []:
+        if item.get("t") == "word" and str(item.get("c") or ""):
+            return True
+    return False
+
+
 def decode_response_text(raw, content_type=""):
     charset_match = re.search(r"charset=([^\s;]+)", content_type or "", flags=re.I)
     encodings = []
@@ -611,16 +618,15 @@ async def process_structured_document(context, page, page_count, temp_dir, outpu
     default_font = "STSong-Light" if use_default_font else None
     emit_progress(progress, f"页面资源准备完成，共 {page_count} 页")
 
-    if not use_default_font:
-        for index in range(1, page_count + 1):
-            if index not in font_urls:
-                raise StructuredResourceNotUsable(f"第 {index} 页缺少字体资源")
-
     for index in range(1, page_count + 1):
         raw_json = await download_text(context, json_urls[index], page.url)
-        (temp_dir / f"{index}.json").write_text(json_callback_body(raw_json), encoding="utf-8")
+        page_json = json_callback_body(raw_json)
+        (temp_dir / f"{index}.json").write_text(page_json, encoding="utf-8")
         (temp_dir / f"{index}.png").write_bytes(await download_bytes(context, png_urls[index], page.url))
-        if not use_default_font:
+        page_data = json.loads(page_json)
+        if not use_default_font and structured_page_needs_font(page_data):
+            if index not in font_urls:
+                raise StructuredResourceNotUsable(f"第 {index} 页缺少字体资源")
             font_css = await download_text(context, font_urls[index], page.url)
             (temp_dir / f"{index}.font.css").write_text(font_css, encoding="utf-8")
             for encoded, family in re.findall(
