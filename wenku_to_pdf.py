@@ -430,6 +430,26 @@ def json_callback_body(text):
     return match.group(1) if match else text
 
 
+def decode_response_text(raw, content_type=""):
+    charset_match = re.search(r"charset=([^\s;]+)", content_type or "", flags=re.I)
+    encodings = []
+    if charset_match:
+        encodings.append(charset_match.group(1).strip("\"'"))
+    encodings.extend(["utf-8-sig", "utf-8", "gb18030", "gbk"])
+
+    tried = set()
+    for encoding in encodings:
+        normalized = encoding.lower()
+        if normalized in tried:
+            continue
+        tried.add(normalized)
+        try:
+            return raw.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 def page_index_from_resource_url(url):
     match = re.search(r"/(\d+)\.(?:json|png)$", urlparse(url).path, flags=re.I)
     return int(match.group(1)) + 1 if match else None
@@ -486,7 +506,7 @@ async def download_text(context, url, referer):
     response = await context.request.get(url, headers={"Referer": referer})
     if response.status >= 400:
         raise RuntimeError(f"HTTP {response.status}: {url[:120]}")
-    return await response.text()
+    return decode_response_text(await response.body(), response.headers.get("content-type", ""))
 
 
 async def download_bytes(context, url, referer):

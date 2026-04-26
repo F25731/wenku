@@ -11,6 +11,7 @@ from wenku_to_pdf import (
     browser_context_options,
     browser_launch_options,
     browser_process_launch_options,
+    decode_response_text,
     excel_direct_image_looks_complete,
     excel_page_image_items,
     full_page_png_looks_complete,
@@ -95,6 +96,13 @@ class BrowserLaunchOptionsTest(unittest.TestCase):
         self.assertTrue(options["headless"])
         self.assertIn("--no-first-run", options["args"])
         self.assertNotIn("viewport", options)
+
+
+class ResponseTextDecodeTest(unittest.TestCase):
+    def test_decodes_gb18030_resource_when_charset_is_missing(self):
+        raw = "第36页结构化资源".encode("gb18030")
+
+        self.assertEqual(decode_response_text(raw, ""), "第36页结构化资源")
 
 
 class PdfFallbackTest(unittest.TestCase):
