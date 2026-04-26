@@ -7,6 +7,7 @@ from PIL import Image, ImageDraw
 from wenku_to_pdf import (
     READER_OVERLAY_HIDE_CSS,
     TOP_MASK_FIRST_PAGE,
+    browser_launch_options,
     excel_direct_image_looks_complete,
     excel_page_image_items,
     is_mostly_blank_image,
@@ -62,6 +63,15 @@ class ReaderOverlayHideCssTest(unittest.TestCase):
     def test_hides_known_reader_overlays_before_screenshot(self):
         for selector in (".tool-bar-wrap", ".toolbar-core-btn", "#app-reader-editor-below", ".doc-hints-wrap"):
             self.assertIn(selector, READER_OVERLAY_HIDE_CSS)
+
+
+class BrowserLaunchOptionsTest(unittest.TestCase):
+    def test_default_launch_options_do_not_force_system_chrome(self):
+        options = browser_launch_options("profile", 2.0)
+
+        self.assertNotIn("channel", options)
+        self.assertEqual(options["user_data_dir"], "profile")
+        self.assertEqual(options["device_scale_factor"], 2.0)
 
 
 class ScreenshotMaskRatioTest(unittest.TestCase):

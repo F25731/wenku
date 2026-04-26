@@ -2,6 +2,7 @@
 import asyncio
 import getpass
 import json
+import os
 import re
 import shutil
 import sys
@@ -20,6 +21,7 @@ GRAY_WATERMARK_WHITE_THRESHOLD = 185
 NEUTRAL_COLOR_TOLERANCE = 35
 WATERMARK_REGION_LEFT = 0.45
 WATERMARK_REGION_TOP = 0.62
+DEFAULT_BROWSER_CHANNEL = os.environ.get("WENKU_BROWSER_CHANNEL", "").strip()
 READER_OVERLAY_HIDE_CSS = """
 .tool-bar-wrap,
 .toolbar-core-btn,
@@ -49,6 +51,23 @@ def emit_progress(progress, message):
     print(message)
     if progress:
         progress(message)
+
+
+def browser_launch_options(profile_dir, scale):
+    options = {
+        "user_data_dir": str(profile_dir),
+        "headless": True,
+        "viewport": {"width": 1440, "height": 1800},
+        "device_scale_factor": scale,
+        "args": [
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-blink-features=AutomationControlled",
+        ],
+    }
+    if DEFAULT_BROWSER_CHANNEL:
+        options["channel"] = DEFAULT_BROWSER_CHANNEL
+    return options
 
 
 def parse_cookie_header(cookie_header):
@@ -818,18 +837,7 @@ async def convert(url, cookie_text, output_dir, temp_root=None, keep_temp=False,
 
     try:
         async with async_playwright() as p:
-            browser_context = await p.chromium.launch_persistent_context(
-                str(profile_dir),
-                channel="chrome",
-                headless=True,
-                viewport={"width": 1440, "height": 1800},
-                device_scale_factor=scale,
-                args=[
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
+            browser_context = await p.chromium.launch_persistent_context(**browser_launch_options(profile_dir, scale))
             page = browser_context.pages[0] if browser_context.pages else await browser_context.new_page()
             await browser_context.add_cookies(parse_cookie_header(cookie_text))
 
