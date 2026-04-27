@@ -9,6 +9,10 @@ debug_probe*/
 structured_runs/
 structured_test_outputs/
 tmp_profile_probe*/
+direct_capture_runs/
+_ref_pansou/
+wenku_direct_capture_test.py
+wenku_structured_experiment.py
 tokens.db
 cookies.json
 cookie.txt

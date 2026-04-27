@@ -689,24 +689,7 @@ def merge_page_pdfs(page_pdfs, output_pdf):
         merger.close()
 
 
-async def process_structured_document(
-    context,
-    page,
-    page_count,
-    temp_dir,
-    output_pdf,
-    data,
-    file_type,
-    progress=None,
-    source_url=None,
-    docinfo=None,
-    direct=False,
-):
-    doc_id = doc_id_from_data_or_url(data, source_url or page.url)
-    if not doc_id:
-        raise StructuredResourceNotUsable("缺少文档 ID，无法进行结构化处理")
-
-    json_urls, png_urls, font_urls = initial_structured_resource_urls(data, doc_id)
+def bind_structured_resource_collector(page, doc_id, json_urls, png_urls, font_urls, docinfo=None):
     json_range_to_page, png_range_to_page = build_docinfo_page_maps(docinfo)
     pending_response_tasks = set()
 
@@ -736,39 +719,32 @@ async def process_structured_document(
         task.add_done_callback(pending_response_tasks.discard)
 
     page.on("response", on_response)
+    return pending_response_tasks
 
-    if source_url:
-        structured_url = url_with_query_params(source_url, edtMode=2)
-        await page.goto(structured_url, wait_until="domcontentloaded", timeout=60000)
-        await safe_wait(page)
-        loaded_data = extract_page_data(await page.content())
-        if loaded_data:
-            data = loaded_data
-            _, _, loaded_file_type, _, loaded_page_count = reader_info(data)
-            file_type = loaded_file_type or file_type
-            page_count = loaded_page_count or page_count
-            doc_id = doc_id_from_data_or_url(data, source_url) or doc_id
-            initial_json, initial_png, initial_font = initial_structured_resource_urls(data, doc_id)
-            json_urls.update(initial_json)
-            png_urls.update(initial_png)
-            font_urls.update(initial_font)
 
-    if not page_count:
-        raise StructuredResourceNotUsable("缺少页数，无法进行结构化处理")
+async def refresh_structured_page_data(page, source_url, data, file_type, page_count, doc_id, json_urls, png_urls, font_urls):
+    if not source_url:
+        return data, file_type, page_count, doc_id
 
-    emit_progress(progress, "正在准备文档资源")
-    await collect_structured_resources(page, page_count, json_urls, png_urls, font_urls, pending_response_tasks, progress=progress)
-    await wait_for_pending_response_tasks(pending_response_tasks)
+    await page.goto(url_with_query_params(source_url, edtMode=2), wait_until="domcontentloaded", timeout=60000)
+    await safe_wait(page)
+    loaded_data = extract_page_data(await page.content())
+    if not loaded_data:
+        return data, file_type, page_count, doc_id
 
-    missing_json = [index for index in range(1, page_count + 1) if index not in json_urls]
-    if missing_json:
-        raise StructuredResourceNotUsable(f"结构化资源不完整，缺少页面：{missing_json[:10]}")
+    _, _, loaded_file_type, _, loaded_page_count = reader_info(loaded_data)
+    loaded_doc_id = doc_id_from_data_or_url(loaded_data, source_url) or doc_id
+    initial_json, initial_png, initial_font = initial_structured_resource_urls(loaded_data, loaded_doc_id)
+    json_urls.update(initial_json)
+    png_urls.update(initial_png)
+    font_urls.update(initial_font)
+    return loaded_data, loaded_file_type or file_type, loaded_page_count or page_count, loaded_doc_id
 
-    default_font = structured_default_font(file_type, direct=direct)
-    emit_progress(progress, f"页面资源准备完成，共 {page_count} 页")
 
+async def prepare_structured_json_pages(context, page, page_count, temp_dir, json_urls, default_font):
     required_png_pages = set()
     required_font_pages = set()
+
     for index in range(1, page_count + 1):
         raw_json = await download_text(context, json_urls[index], page.url)
         page_json = json_callback_body(raw_json)
@@ -780,6 +756,20 @@ async def process_structured_document(
         if needs["font"] and not default_font:
             required_font_pages.add(index)
 
+    return required_png_pages, required_font_pages
+
+
+async def ensure_structured_assets(
+    page,
+    page_count,
+    json_urls,
+    png_urls,
+    font_urls,
+    pending_response_tasks,
+    required_png_pages,
+    required_font_pages,
+    progress=None,
+):
     missing_png = [index for index in sorted(required_png_pages) if index not in png_urls]
     missing_font = [index for index in sorted(required_font_pages) if index not in font_urls]
     if missing_png or missing_font:
@@ -803,12 +793,12 @@ async def process_structured_document(
     if missing_font:
         raise StructuredResourceNotUsable(f"结构化字体资源不完整，缺少页面：{missing_font[:10]}")
 
+
+async def download_structured_assets(context, page, page_count, temp_dir, png_urls, font_urls, required_png_pages, required_font_pages, progress=None):
     for index in range(1, page_count + 1):
         if index in required_png_pages:
             (temp_dir / f"{index}.png").write_bytes(await download_bytes(context, png_urls[index], page.url))
         if index in required_font_pages:
-            if index not in font_urls:
-                raise StructuredResourceNotUsable(f"第 {index} 页缺少字体资源")
             font_css = await download_text(context, font_urls[index], page.url)
             (temp_dir / f"{index}.font.css").write_text(font_css, encoding="utf-8")
             for encoded, family in re.findall(
@@ -818,14 +808,89 @@ async def process_structured_document(
                 (temp_dir / f"{family}.ttf").write_bytes(base64.b64decode(encoded))
         emit_progress(progress, f"处理第 {index}/{page_count} 页 ✅")
 
+
+def render_structured_pdf(temp_dir, page_count, output_pdf, default_font=None):
     page_pdfs = []
     font_replace = {}
     for index in range(1, page_count + 1):
         font_replace, page_pdf = save_structured_page_pdf(temp_dir, index, font_replace=font_replace, default_font=default_font)
         page_pdfs.append(page_pdf)
+    merge_page_pdfs(page_pdfs, output_pdf)
+
+
+async def process_structured_document(
+    context,
+    page,
+    page_count,
+    temp_dir,
+    output_pdf,
+    data,
+    file_type,
+    progress=None,
+    source_url=None,
+    docinfo=None,
+    direct=False,
+):
+    doc_id = doc_id_from_data_or_url(data, source_url or page.url)
+    if not doc_id:
+        raise StructuredResourceNotUsable("缺少文档 ID，无法进行结构化处理")
+
+    json_urls, png_urls, font_urls = initial_structured_resource_urls(data, doc_id)
+    pending_response_tasks = bind_structured_resource_collector(page, doc_id, json_urls, png_urls, font_urls, docinfo=docinfo)
+    data, file_type, page_count, doc_id = await refresh_structured_page_data(
+        page,
+        source_url,
+        data,
+        file_type,
+        page_count,
+        doc_id,
+        json_urls,
+        png_urls,
+        font_urls,
+    )
+
+    if not page_count:
+        raise StructuredResourceNotUsable("缺少页数，无法进行结构化处理")
+
+    emit_progress(progress, "正在准备文档资源")
+    await collect_structured_resources(page, page_count, json_urls, png_urls, font_urls, pending_response_tasks, progress=progress)
+    await wait_for_pending_response_tasks(pending_response_tasks)
+
+    missing_json = [index for index in range(1, page_count + 1) if index not in json_urls]
+    if missing_json:
+        raise StructuredResourceNotUsable(f"结构化资源不完整，缺少页面：{missing_json[:10]}")
+
+    default_font = structured_default_font(file_type, direct=direct)
+    emit_progress(progress, f"页面资源准备完成，共 {page_count} 页")
+
+    required_png_pages, required_font_pages = await prepare_structured_json_pages(
+        context, page, page_count, temp_dir, json_urls, default_font
+    )
+    await ensure_structured_assets(
+        page,
+        page_count,
+        json_urls,
+        png_urls,
+        font_urls,
+        pending_response_tasks,
+        required_png_pages,
+        required_font_pages,
+        progress=progress,
+    )
+    await download_structured_assets(
+        context,
+        page,
+        page_count,
+        temp_dir,
+        png_urls,
+        font_urls,
+        required_png_pages,
+        required_font_pages,
+        progress=progress,
+    )
 
     emit_progress(progress, "页面处理完成，正在生成最终文件")
-    merge_page_pdfs(page_pdfs, output_pdf)
+    render_structured_pdf(temp_dir, page_count, output_pdf, default_font=default_font)
     return {"mode": "structured-json-pdf", "pages": page_count}
 
 
@@ -1288,17 +1353,21 @@ async def process_html_screenshots(
     return {"mode": "html-render-screenshot-masked", "pages": page_count}
 
 
-async def convert_in_context(browser_context, url, cookie_text, temp_dir, output_dir, progress=None):
-    page = browser_context.pages[0] if browser_context.pages else await browser_context.new_page()
-    await browser_context.add_cookies(parse_cookie_header(cookie_text))
+async def load_page_data(page, url):
+    await page.goto(url_with_query_params(url, edtMode=2), wait_until="domcontentloaded", timeout=60000)
+    await safe_wait(page)
+    data = extract_page_data(await page.content())
+    if not data:
+        raise RuntimeError("Cannot find pageData in document page")
+    return data
 
-    emit_progress(progress, "正在进入文档空间")
-    emit_progress(progress, "正在读取文档信息")
 
+async def read_document_metadata(browser_context, page, url):
     data = None
-    tpl_key = ""
     direct_docinfo = None
+    tpl_key = ""
     doc_id = doc_id_from_data_or_url({}, url)
+
     if doc_id:
         try:
             direct_docinfo = await fetch_docinfo(browser_context, doc_id, url)
@@ -1308,164 +1377,159 @@ async def convert_in_context(browser_context, url, cookie_text, temp_dir, output
     if direct_docinfo:
         title, file_type, page_count = docinfo_document_info(direct_docinfo)
     else:
-        await page.goto(url_with_query_params(url, edtMode=2), wait_until="domcontentloaded", timeout=60000)
-        await safe_wait(page)
-        html = await page.content()
-        data = extract_page_data(html)
-        if not data:
-            raise RuntimeError("Cannot find pageData in document page")
+        data = await load_page_data(page, url)
         title = title_from_page_data(data, await page.title())
         _, _, file_type, tpl_key, page_count = reader_info(data)
 
-    output_pdf = output_dir / f"{title}.pdf"
+    return {
+        "data": data,
+        "docinfo": direct_docinfo,
+        "title": title,
+        "file_type": file_type,
+        "tpl_key": tpl_key,
+        "page_count": page_count,
+    }
 
-    emit_progress(progress, f"文档名称：{title}")
-    emit_progress(progress, f"文档页数：{page_count or 'unknown'}")
 
-    if direct_docinfo and file_type in DIRECT_STRUCTURED_TYPES:
-        emit_progress(progress, "已选择最佳处理方案")
-        try:
-            result = await process_structured_document(
-                browser_context,
-                page,
-                page_count,
-                temp_dir,
-                output_pdf,
-                {},
-                file_type,
-                progress=progress,
-                source_url=url,
-                docinfo=direct_docinfo,
-                direct=True,
-            )
-            emit_progress(progress, f"最终文件已生成：{output_pdf.name}")
-            return {"output": str(output_pdf), **result}
-        except StructuredResourceNotUsable:
-            emit_progress(progress, "正在切换备用处理方案")
+async def ensure_rendered_document_data(page, url, document):
+    if document["data"] is None:
+        data = await load_page_data(page, url)
+        _, _, file_type, tpl_key, page_count = reader_info(data)
+        document.update(
+            {
+                "data": data,
+                "file_type": file_type or document["file_type"],
+                "tpl_key": tpl_key,
+                "page_count": page_count or document["page_count"],
+            }
+        )
+    return document
 
-    if data is None:
-        await page.goto(url_with_query_params(url, edtMode=2), wait_until="domcontentloaded", timeout=60000)
-        await safe_wait(page)
-        html = await page.content()
-        data = extract_page_data(html)
-        if not data:
-            raise RuntimeError("Cannot find pageData in document page")
-        _, _, loaded_file_type, tpl_key, loaded_page_count = reader_info(data)
-        file_type = loaded_file_type or file_type
-        page_count = loaded_page_count or page_count
 
-    if file_type in {"ppt", "pptx"} or tpl_key == "new_view":
-        emit_progress(progress, "已选择最佳处理方案")
-        result = await process_ppt(browser_context, page, page_count, temp_dir, output_pdf, data, progress=progress)
-    elif file_type == "pdf":
-        emit_progress(progress, "已选择最佳处理方案")
-        try:
-            result = await process_structured_document(
-                browser_context,
-                page,
-                page_count,
-                temp_dir,
-                output_pdf,
-                data,
-                file_type,
-                progress=progress,
-                source_url=url,
-                docinfo=direct_docinfo,
-            )
-        except StructuredResourceNotUsable:
-            emit_progress(progress, "正在切换备用处理方案")
-            try:
-                result = await process_pdf_page_images(browser_context, page, page_count, temp_dir, output_pdf, data, progress=progress)
-            except PdfDirectImageNotUsable:
-                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                await safe_wait(page)
-                await exit_editor_mode_if_needed(page, progress=progress)
-                result = await process_html_screenshots(
-                    page,
-                    page_count,
-                    temp_dir,
-                    output_pdf,
-                    clean_watermark=True,
-                    progress=progress,
-                    require_nonblank_pages=True,
-                    hide_overlays=True,
-                )
-    elif file_type in {"excel", "xls", "xlsx"}:
-        emit_progress(progress, "已选择最佳处理方案")
-        try:
-            result = await process_structured_document(
-                browser_context,
-                page,
-                page_count,
-                temp_dir,
-                output_pdf,
-                data,
-                file_type,
-                progress=progress,
-                source_url=url,
-                docinfo=direct_docinfo,
-            )
-        except StructuredResourceNotUsable:
-            emit_progress(progress, "正在切换备用处理方案")
-            try:
-                result = await process_excel_page_images(browser_context, page, page_count, temp_dir, output_pdf, data, progress=progress)
-            except ExcelDirectImageNotUsable:
-                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                await safe_wait(page)
-                await exit_editor_mode_if_needed(page, progress=progress)
-                result = await process_html_screenshots(
-                    page,
-                    page_count,
-                    temp_dir,
-                    output_pdf,
-                    clean_watermark=True,
-                    progress=progress,
-                    require_nonblank_pages=True,
-                    hide_overlays=True,
-                )
-    elif file_type in {"word", "doc", "docx"}:
-        emit_progress(progress, "已选择最佳处理方案")
-        try:
-            result = await process_structured_document(
-                browser_context,
-                page,
-                page_count,
-                temp_dir,
-                output_pdf,
-                data,
-                file_type,
-                progress=progress,
-                source_url=url,
-                docinfo=direct_docinfo,
-            )
-        except StructuredResourceNotUsable:
-            emit_progress(progress, "正在切换备用处理方案")
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await safe_wait(page)
-            await exit_editor_mode_if_needed(page, progress=progress)
-            result = await process_html_screenshots(
-                page,
-                page_count,
-                temp_dir,
-                output_pdf,
-                clean_watermark=True,
-                progress=progress,
-                require_nonblank_pages=False,
-                hide_overlays=False,
-            )
-    else:
-        emit_progress(progress, "已选择最佳处理方案")
-        await exit_editor_mode_if_needed(page, progress=progress)
-        result = await process_html_screenshots(
+async def try_direct_structured_document(browser_context, page, temp_dir, output_pdf, document, url, progress=None):
+    if not document["docinfo"] or document["file_type"] not in DIRECT_STRUCTURED_TYPES:
+        return None
+
+    try:
+        return await process_structured_document(
+            browser_context,
             page,
-            page_count,
+            document["page_count"],
             temp_dir,
             output_pdf,
-            clean_watermark=True,
+            {},
+            document["file_type"],
             progress=progress,
-            require_nonblank_pages=False,
-            hide_overlays=False,
+            source_url=url,
+            docinfo=document["docinfo"],
+            direct=True,
         )
+    except StructuredResourceNotUsable:
+        emit_progress(progress, "正在切换备用处理方案")
+        return None
+
+
+async def fallback_html_screenshots(
+    page,
+    url,
+    page_count,
+    temp_dir,
+    output_pdf,
+    progress=None,
+    require_nonblank_pages=False,
+    hide_overlays=False,
+):
+    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    await safe_wait(page)
+    await exit_editor_mode_if_needed(page, progress=progress)
+    return await process_html_screenshots(
+        page,
+        page_count,
+        temp_dir,
+        output_pdf,
+        clean_watermark=True,
+        progress=progress,
+        require_nonblank_pages=require_nonblank_pages,
+        hide_overlays=hide_overlays,
+    )
+
+
+async def process_structured_from_document(browser_context, page, temp_dir, output_pdf, document, url, progress=None):
+    return await process_structured_document(
+        browser_context,
+        page,
+        document["page_count"],
+        temp_dir,
+        output_pdf,
+        document["data"],
+        document["file_type"],
+        progress=progress,
+        source_url=url,
+        docinfo=document["docinfo"],
+    )
+
+
+async def process_document_by_type(browser_context, page, temp_dir, output_pdf, document, url, progress=None):
+    file_type = document["file_type"]
+    tpl_key = document["tpl_key"]
+    page_count = document["page_count"]
+    data = document["data"]
+
+    if file_type in {"ppt", "pptx"} or tpl_key == "new_view":
+        return await process_ppt(browser_context, page, page_count, temp_dir, output_pdf, data, progress=progress)
+
+    if file_type == "pdf":
+        try:
+            return await process_structured_from_document(browser_context, page, temp_dir, output_pdf, document, url, progress=progress)
+        except StructuredResourceNotUsable:
+            emit_progress(progress, "正在切换备用处理方案")
+            try:
+                return await process_pdf_page_images(browser_context, page, page_count, temp_dir, output_pdf, data, progress=progress)
+            except PdfDirectImageNotUsable:
+                return await fallback_html_screenshots(
+                    page, url, page_count, temp_dir, output_pdf, progress=progress, require_nonblank_pages=True, hide_overlays=True
+                )
+
+    if file_type in {"excel", "xls", "xlsx"}:
+        try:
+            return await process_structured_from_document(browser_context, page, temp_dir, output_pdf, document, url, progress=progress)
+        except StructuredResourceNotUsable:
+            emit_progress(progress, "正在切换备用处理方案")
+            try:
+                return await process_excel_page_images(browser_context, page, page_count, temp_dir, output_pdf, data, progress=progress)
+            except ExcelDirectImageNotUsable:
+                return await fallback_html_screenshots(
+                    page, url, page_count, temp_dir, output_pdf, progress=progress, require_nonblank_pages=True, hide_overlays=True
+                )
+
+    if file_type in {"word", "doc", "docx"}:
+        try:
+            return await process_structured_from_document(browser_context, page, temp_dir, output_pdf, document, url, progress=progress)
+        except StructuredResourceNotUsable:
+            emit_progress(progress, "正在切换备用处理方案")
+            return await fallback_html_screenshots(page, url, page_count, temp_dir, output_pdf, progress=progress)
+
+    await exit_editor_mode_if_needed(page, progress=progress)
+    return await process_html_screenshots(page, page_count, temp_dir, output_pdf, clean_watermark=True, progress=progress)
+
+
+async def convert_in_context(browser_context, url, cookie_text, temp_dir, output_dir, progress=None):
+    page = browser_context.pages[0] if browser_context.pages else await browser_context.new_page()
+    await browser_context.add_cookies(parse_cookie_header(cookie_text))
+
+    emit_progress(progress, "正在进入文档空间")
+    emit_progress(progress, "正在读取文档信息")
+    document = await read_document_metadata(browser_context, page, url)
+    output_pdf = output_dir / f"{document['title']}.pdf"
+
+    emit_progress(progress, f"文档名称：{document['title']}")
+    emit_progress(progress, f"文档页数：{document['page_count'] or 'unknown'}")
+    emit_progress(progress, "已选择最佳处理方案")
+
+    result = await try_direct_structured_document(browser_context, page, temp_dir, output_pdf, document, url, progress=progress)
+    if result is None:
+        document = await ensure_rendered_document_data(page, url, document)
+        result = await process_document_by_type(browser_context, page, temp_dir, output_pdf, document, url, progress=progress)
 
     emit_progress(progress, f"最终文件已生成：{output_pdf.name}")
     return {"output": str(output_pdf), **result}
