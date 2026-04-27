@@ -52,6 +52,7 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 jobs = {}
 jobs_lock = threading.Lock()
+job_runtimes = {}
 cookie_pool_lock = threading.Lock()
 cookie_pool_cursor = 0
 token_db_lock = threading.Lock()
@@ -61,6 +62,10 @@ job_workers_started = False
 active_job_count = 0
 waiting_job_count = 0
 download_cleaner_started = False
+
+
+class JobCancelled(Exception):
+    pass
 
 
 def format_time(timestamp):
@@ -326,11 +331,15 @@ def job_concurrency_limit():
     return min(cookie_count, MAX_QUEUE_WORKERS)
 
 
-def acquire_job_slot():
+def acquire_job_slot(cancel_check=None):
     global active_job_count
     with job_capacity_condition:
         while active_job_count >= job_concurrency_limit():
+            if cancel_check and cancel_check():
+                raise JobCancelled("任务已取消")
             job_capacity_condition.wait(timeout=2)
+        if cancel_check and cancel_check():
+            raise JobCancelled("任务已取消")
         active_job_count += 1
         return active_job_count, job_concurrency_limit()
 
@@ -665,6 +674,47 @@ def get_job_snapshot(job_id):
         return snapshot
 
 
+def job_is_cancel_requested(job_id):
+    with jobs_lock:
+        job = jobs.get(job_id)
+        return bool(job and job.get("cancel_requested"))
+
+
+def ensure_job_not_cancelled(job_id):
+    if job_is_cancel_requested(job_id):
+        raise JobCancelled("任务已取消")
+
+
+def set_job_runtime(job_id, runtime):
+    with jobs_lock:
+        if runtime is None:
+            job_runtimes.pop(job_id, None)
+        else:
+            job_runtimes[job_id] = runtime
+
+
+def request_job_cancel(job_id):
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            return None
+        status = job.get("status")
+        if status in {"done", "error", "cancelled"}:
+            return status
+        job["cancel_requested"] = True
+        if status == "running":
+            job["status"] = "canceling"
+        else:
+            job["status"] = "cancelled"
+            job["finished_at"] = time.time()
+        runtime = job_runtimes.get(job_id)
+    with job_capacity_condition:
+        job_capacity_condition.notify_all()
+    if runtime:
+        runtime.request_interrupt()
+    return "canceling" if status == "running" else "cancelled"
+
+
 class WorkerBrowserRuntime:
     def __init__(
         self,
@@ -711,6 +761,11 @@ class WorkerBrowserRuntime:
                 pass
         self.playwright = None
         self.completed_jobs = 0
+
+    def request_interrupt(self):
+        if self.loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(self.restart_browser(), self.loop)
+            future.add_done_callback(lambda item: item.exception() if not item.cancelled() else None)
 
     async def convert(self, **kwargs):
         attempts = self.retry_count + 1
@@ -791,15 +846,18 @@ class WorkerBrowserRuntime:
 
 def run_convert_job(job_id, url, cookie, cookie_slot=None, cookie_total=None, browser_runtime=None):
     started_at = time.perf_counter()
+    ensure_job_not_cancelled(job_id)
     update_job(job_id, status="running")
     if cookie_slot and cookie_total:
         add_job_log(job_id, f"已分配 Cookie {cookie_slot}/{cookie_total}", "ok")
     add_job_log(job_id, "任务已进入后台队列", "ok")
 
     def progress(message):
+        ensure_job_not_cancelled(job_id)
         add_job_log(job_id, message)
 
     try:
+        set_job_runtime(job_id, browser_runtime)
         convert_kwargs = {
             "url": url,
             "cookie_text": cookie,
@@ -826,9 +884,18 @@ def run_convert_job(job_id, url, cookie, cookie_slot=None, cookie_total=None, br
         add_job_log(job_id, payload["message"], "ok")
         add_job_log(job_id, f"文件已保存：{filename}", "ok")
         update_job(job_id, status="done", result=payload, finished_at=time.time())
+    except JobCancelled:
+        add_job_log(job_id, "任务已取消", "error")
+        update_job(job_id, status="cancelled", error="任务已取消", finished_at=time.time())
     except Exception as exc:
-        add_job_log(job_id, f"转换失败：{exc}", "error")
-        update_job(job_id, status="error", error=str(exc), finished_at=time.time())
+        if job_is_cancel_requested(job_id):
+            add_job_log(job_id, "任务已取消", "error")
+            update_job(job_id, status="cancelled", error="任务已取消", finished_at=time.time())
+        else:
+            add_job_log(job_id, f"转换失败：{exc}", "error")
+            update_job(job_id, status="error", error=str(exc), finished_at=time.time())
+    finally:
+        set_job_runtime(job_id, None)
 
 
 def queued_convert_worker(worker_id):
@@ -842,7 +909,9 @@ def queued_convert_worker(worker_id):
     while True:
         job_id, url, override_cookie = job_queue.get()
         has_waiting_marker = False
+        slot_acquired = False
         try:
+            ensure_job_not_cancelled(job_id)
             update_job(job_id, status="queued")
             waiting_count = queued_job_count()
             if waiting_count:
@@ -850,10 +919,12 @@ def queued_convert_worker(worker_id):
 
             add_waiting_job()
             has_waiting_marker = True
-            active_count, limit = acquire_job_slot()
+            active_count, limit = acquire_job_slot(lambda: job_is_cancel_requested(job_id))
+            slot_acquired = True
             remove_waiting_job()
             has_waiting_marker = False
             try:
+                ensure_job_not_cancelled(job_id)
                 if override_cookie:
                     cookie = override_cookie
                     cookie_slot = None
@@ -867,7 +938,11 @@ def queued_convert_worker(worker_id):
                 add_job_log(job_id, f"进入处理通道 {active_count}/{limit}", "ok")
                 run_convert_job(job_id, url, cookie, cookie_slot, cookie_total, browser_runtime=browser_runtime)
             finally:
-                release_job_slot()
+                if slot_acquired:
+                    release_job_slot()
+        except JobCancelled:
+            add_job_log(job_id, "任务已取消", "error")
+            update_job(job_id, status="cancelled", error="任务已取消", finished_at=time.time())
         except Exception as exc:
             add_job_log(job_id, f"转换失败：{exc}", "error")
             update_job(job_id, status="error", error=str(exc), finished_at=time.time())
@@ -1093,6 +1168,22 @@ def api_job(job_id):
     if not snapshot:
         return jsonify({"error": "任务不存在或已过期"}), 404
     return jsonify(snapshot)
+
+
+@app.route("/api/job/<job_id>/cancel", methods=["POST"])
+def api_job_cancel(job_id):
+    data = request.get_json(silent=True) or {}
+    token = request_access_token(data)
+    scope = request_access_scope(data)
+    token_ok, token_message, _ = verify_access_token(token, scope=scope)
+    if not token_ok:
+        return jsonify({"error": token_message}), 403
+
+    status = request_job_cancel(job_id)
+    if status is None:
+        return jsonify({"error": "任务不存在或已过期"}), 404
+    add_job_log(job_id, "已收到取消指令", "error")
+    return jsonify({"success": True, "status": status})
 
 
 @app.route("/api/admin/tokens", methods=["GET", "POST"])

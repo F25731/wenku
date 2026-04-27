@@ -148,6 +148,13 @@
                     <span id="btnText"><i class="fas fa-lock mr-2"></i>请先验证 Token</span>
                     <div id="loader" class="loader ml-3 hidden"></div>
                 </button>
+                <button
+                    type="button"
+                    id="cancelBtn"
+                    class="hidden flex w-full items-center justify-center rounded-xl border border-red-200 bg-red-50 px-6 py-3 font-semibold text-red-600 transition-colors hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                    <i class="fas fa-stop-circle mr-2"></i>取消转换
+                </button>
 
                 <div id="statusStream" class="status-stream rounded-xl bg-gray-950 p-4 font-mono text-xs leading-6 text-indigo-50 shadow-inner">
                     <div class="flex min-w-0 gap-3 text-indigo-200">
@@ -232,6 +239,7 @@
     <script>
         const form = document.getElementById('convertForm');
         const submitBtn = document.getElementById('submitBtn');
+        const cancelBtn = document.getElementById('cancelBtn');
         const btnText = document.getElementById('btnText');
         const loader = document.getElementById('loader');
         const resultBox = document.getElementById('resultBox');
@@ -251,6 +259,7 @@
         let accessToken = '';
         let pollTimer = null;
         let lastLogId = 0;
+        let currentJobId = null;
 
         function resetStream() {
             statusStream.innerHTML = '';
@@ -288,7 +297,8 @@
                 idle: ['bg-white', 'text-indigo-700', 'h-2 w-2 rounded-full bg-indigo-400'],
                 running: ['bg-indigo-600', 'text-white', 'pulse-dot'],
                 done: ['bg-green-600', 'text-white', 'h-2 w-2 rounded-full bg-green-200'],
-                error: ['bg-red-600', 'text-white', 'h-2 w-2 rounded-full bg-red-200']
+                error: ['bg-red-600', 'text-white', 'h-2 w-2 rounded-full bg-red-200'],
+                cancelled: ['bg-gray-700', 'text-white', 'h-2 w-2 rounded-full bg-gray-200']
             };
             const [bg, text, dot] = colors[tone] || colors.idle;
             statePill.className = `inline-flex items-center gap-2 rounded-full ${bg} px-3 py-1 text-xs font-semibold ${text} shadow-sm`;
@@ -297,6 +307,9 @@
 
         function setRunning(isRunning) {
             submitBtn.disabled = isRunning || !accessToken;
+            cancelBtn.classList.toggle('hidden', !isRunning);
+            cancelBtn.disabled = !isRunning;
+            cancelBtn.innerHTML = '<i class="fas fa-stop-circle mr-2"></i>取消转换';
             loader.classList.toggle('hidden', !isRunning);
             btnText.innerHTML = isRunning
                 ? '<i class="fas fa-spinner mr-2"></i>正在处理，请稍等...'
@@ -385,6 +398,12 @@
             resultBox.classList.remove('hidden');
         }
 
+        function renderCancelled() {
+            resultBox.className = 'rounded-xl border border-gray-200 bg-gray-50 p-4 text-sm text-gray-600';
+            resultBox.innerHTML = '<i class="fas fa-stop-circle mr-2"></i><strong>已取消：</strong>当前任务已结束，可以重新提交。';
+            resultBox.classList.remove('hidden');
+        }
+
         async function pollJob(jobId) {
             const response = await fetch(`/api/job/${jobId}?token=${encodeURIComponent(accessToken)}&scope=web`);
             const data = await response.json();
@@ -401,14 +420,25 @@
 
             if (data.status === 'done') {
                 clearTimeout(pollTimer);
+                currentJobId = null;
                 setRunning(false);
                 setState('完成', 'done');
                 renderSuccess(data.result);
                 return;
             }
 
+            if (data.status === 'cancelled') {
+                clearTimeout(pollTimer);
+                currentJobId = null;
+                setRunning(false);
+                setState('已取消', 'cancelled');
+                renderCancelled();
+                return;
+            }
+
             if (data.status === 'error') {
                 clearTimeout(pollTimer);
+                currentJobId = null;
                 setRunning(false);
                 setState('失败', 'error');
                 renderError(data.error || '未知错误');
@@ -420,6 +450,7 @@
 
         function handlePollError(error) {
             clearTimeout(pollTimer);
+            currentJobId = null;
             setRunning(false);
             setState('失败', 'error');
             appendLog({ time: new Date().toLocaleTimeString('zh-CN', { hour12: false }), level: 'error', message: error.message });
@@ -447,12 +478,15 @@
             clearTimeout(pollTimer);
 
             const url = document.getElementById('url').value.trim();
+            currentJobId = null;
             resultBox.classList.add('hidden');
             modeValue.textContent = '自动识别';
             pagesValue.textContent = '--';
             timeValue.textContent = '--';
             resetStream();
             setRunning(true);
+            cancelBtn.disabled = true;
+            cancelBtn.innerHTML = '<i class="fas fa-spinner mr-2"></i>等待任务创建...';
             setState('处理中', 'running');
 
             try {
@@ -471,12 +505,43 @@
                     }
                     throw new Error(data.error || '任务创建失败');
                 }
+                currentJobId = data.job_id;
+                cancelBtn.disabled = false;
+                cancelBtn.innerHTML = '<i class="fas fa-stop-circle mr-2"></i>取消转换';
                 pollJob(data.job_id).catch(handlePollError);
             } catch (error) {
+                currentJobId = null;
                 setRunning(false);
                 setState('失败', 'error');
                 appendLog({ time: new Date().toLocaleTimeString('zh-CN', { hour12: false }), level: 'error', message: error.message });
                 renderError(error.message);
+            }
+        });
+
+        cancelBtn.addEventListener('click', async () => {
+            if (!currentJobId) return;
+            cancelBtn.disabled = true;
+            cancelBtn.innerHTML = '<i class="fas fa-spinner mr-2"></i>正在取消...';
+            setState('取消中', 'running');
+            try {
+                const response = await fetch(`/api/job/${currentJobId}/cancel`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ token: accessToken, scope: 'web' })
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.error || '取消失败');
+                }
+                appendLog({
+                    time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+                    level: 'error',
+                    message: '已请求取消当前任务'
+                });
+            } catch (error) {
+                cancelBtn.disabled = false;
+                cancelBtn.innerHTML = '<i class="fas fa-stop-circle mr-2"></i>取消转换';
+                appendLog({ time: new Date().toLocaleTimeString('zh-CN', { hour12: false }), level: 'error', message: error.message });
             }
         });
 

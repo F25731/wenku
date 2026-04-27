@@ -286,6 +286,79 @@ class TokenBackendTest(unittest.TestCase):
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.get_json()["error"], "请先输入使用 Token")
 
+    def test_cancel_queued_job_marks_it_cancelled(self):
+        token = app.create_access_token(1, "cancel")
+        job_id = "queued-cancel-test"
+        with app.jobs_lock:
+            app.jobs[job_id] = {
+                "id": job_id,
+                "status": "queued",
+                "created_at": app.time.time(),
+                "finished_at": None,
+                "result": None,
+                "error": None,
+                "logs": [],
+                "log_seq": 0,
+                "cancel_requested": False,
+            }
+
+        try:
+            response = app.app.test_client().post(
+                f"/api/job/{job_id}/cancel",
+                json={"token": token["token"], "scope": "web"},
+            )
+            snapshot = app.get_job_snapshot(job_id)
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.get_json()["status"], "cancelled")
+            self.assertTrue(snapshot["cancel_requested"])
+            self.assertEqual(snapshot["status"], "cancelled")
+        finally:
+            with app.jobs_lock:
+                app.jobs.pop(job_id, None)
+
+    def test_cancel_running_job_interrupts_runtime(self):
+        token = app.create_access_token(1, "cancel")
+        job_id = "running-cancel-test"
+
+        class Runtime:
+            interrupted = False
+
+            def request_interrupt(self):
+                self.interrupted = True
+
+        runtime = Runtime()
+        with app.jobs_lock:
+            app.jobs[job_id] = {
+                "id": job_id,
+                "status": "running",
+                "created_at": app.time.time(),
+                "finished_at": None,
+                "result": None,
+                "error": None,
+                "logs": [],
+                "log_seq": 0,
+                "cancel_requested": False,
+            }
+            app.job_runtimes[job_id] = runtime
+
+        try:
+            response = app.app.test_client().post(
+                f"/api/job/{job_id}/cancel",
+                json={"token": token["token"], "scope": "web"},
+            )
+            snapshot = app.get_job_snapshot(job_id)
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.get_json()["status"], "canceling")
+            self.assertTrue(snapshot["cancel_requested"])
+            self.assertEqual(snapshot["status"], "canceling")
+            self.assertTrue(runtime.interrupted)
+        finally:
+            with app.jobs_lock:
+                app.jobs.pop(job_id, None)
+                app.job_runtimes.pop(job_id, None)
+
     def test_admin_api_creates_access_token(self):
         client = app.app.test_client()
 
