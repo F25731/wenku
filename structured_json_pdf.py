@@ -25,6 +25,12 @@ def _safe_float(value, fallback=0.0):
         return fallback
 
 
+def normalize_text_for_pdf(text, default_font=None):
+    if default_font:
+        text = text.replace("•", "·")
+    return text
+
+
 def _register_page_fonts(temp_dir, pagenum):
     reload(pdfmetrics)
     fonts = []
@@ -72,7 +78,7 @@ def save_structured_page_pdf(temp_dir, pagenum, font_replace=None, default_font=
                 style.update(styles.get(style_id) or {})
             style.update(item.get("s") or {})
 
-            text = str(item.get("c") or "")
+            text = normalize_text_for_pdf(str(item.get("c") or ""), default_font=default_font)
             if not text:
                 continue
             text_object = pdf.beginText()
