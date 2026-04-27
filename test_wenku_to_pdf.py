@@ -4,7 +4,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-from structured_json_pdf import normalize_text_for_pdf
+from structured_json_pdf import choose_pdf_font_for_text, normalize_text_for_pdf
 from wenku_to_pdf import (
     PdfDirectImageNotUsable,
     READER_OVERLAY_HIDE_CSS,
@@ -268,6 +268,10 @@ class StructuredResourceTest(unittest.TestCase):
     def test_normalizes_bullet_for_cjk_pdf_font(self):
         self.assertEqual(normalize_text_for_pdf("威廉•F•夏普", default_font="STSong-Light"), "威廉·F·夏普")
         self.assertEqual(normalize_text_for_pdf("威廉•F•夏普", default_font=None), "威廉•F•夏普")
+
+    def test_uses_builtin_font_for_standalone_bullet(self):
+        self.assertEqual(choose_pdf_font_for_text("·", default_font="STSong-Light"), "Helvetica")
+        self.assertEqual(choose_pdf_font_for_text("正文", default_font="STSong-Light"), "STSong-Light")
 
     def test_merges_readerinfo_html_urls_by_page_index(self):
         json_urls = {}

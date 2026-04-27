@@ -31,6 +31,12 @@ def normalize_text_for_pdf(text, default_font=None):
     return text
 
 
+def choose_pdf_font_for_text(text, default_font=None):
+    if default_font and text.strip() in {"•", "·"}:
+        return "Helvetica"
+    return default_font
+
+
 def _register_page_fonts(temp_dir, pagenum):
     reload(pdfmetrics)
     fonts = []
@@ -89,7 +95,7 @@ def save_structured_page_pdf(temp_dir, pagenum, font_replace=None, default_font=
             font_family = style.get("font-family")
             if default_font:
                 try:
-                    text_object.setFont(default_font, font_size)
+                    text_object.setFont(choose_pdf_font_for_text(text, default_font), font_size)
                 except Exception:
                     pass
             elif font_family:
