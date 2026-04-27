@@ -730,8 +730,11 @@ class WorkerBrowserRuntime:
             attempt_kwargs["progress"] = progress
             try:
                 operation = asyncio.create_task(convert_with_browser(browser=browser, **attempt_kwargs))
+                await asyncio.sleep(0)
                 startup_timeout = self.startup_attempt_timeout_seconds
-                if self.startup_total_timeout_seconds:
+                if document_ready.is_set():
+                    startup_timeout = None
+                elif self.startup_total_timeout_seconds:
                     remaining = self.startup_total_timeout_seconds - (time.monotonic() - first_started_at)
                     if remaining <= 0:
                         raise TimeoutError(f"启动阶段超过 {self.startup_total_timeout_seconds:g} 秒，已自动释放通道")

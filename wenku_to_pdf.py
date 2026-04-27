@@ -30,6 +30,17 @@ NEUTRAL_COLOR_TOLERANCE = 35
 WATERMARK_REGION_LEFT = 0.45
 WATERMARK_REGION_TOP = 0.62
 DEFAULT_BROWSER_CHANNEL = os.environ.get("WENKU_BROWSER_CHANNEL", "").strip()
+RESOURCE_REQUEST_TIMEOUT_MS = int(os.environ.get("WENKU_RESOURCE_REQUEST_TIMEOUT_MS", "30000"))
+RESOURCE_REQUEST_RETRIES = int(os.environ.get("WENKU_RESOURCE_REQUEST_RETRIES", "2"))
+STRUCTURED_CAPTURE_ROUNDS = int(os.environ.get("WENKU_STRUCTURED_CAPTURE_ROUNDS", "12"))
+STRUCTURED_CAPTURE_DEADLINE_SECONDS = float(os.environ.get("WENKU_STRUCTURED_CAPTURE_DEADLINE_SECONDS", "150"))
+DIRECT_STRUCTURED_TYPES = {"word", "doc", "docx", "pdf"}
+DOCINFO_TYPE_MAP = {
+    "1": "word",
+    "2": "excel",
+    "3": "ppt",
+    "4": "pdf",
+}
 READER_OVERLAY_HIDE_CSS = """
 .tool-bar-wrap,
 .toolbar-core-btn,
@@ -348,6 +359,58 @@ def pdf_range_start(url):
     return int(match.group(1)) if match else None
 
 
+def parse_range_value(value):
+    if not value:
+        return None
+    value = str(value).strip()
+    if "-" not in value:
+        return None
+    start, _, end = value.partition("-")
+    try:
+        return int(start), int(end) if end else None
+    except ValueError:
+        return None
+
+
+def query_range(url):
+    value = (parse_qs(urlparse(url).query).get("x-bce-range") or [""])[0]
+    return parse_range_value(value)
+
+
+def zoom_png_range(zoom):
+    query = parse_qs(str(zoom or "").lstrip("&"))
+    return parse_range_value((query.get("png") or [""])[0])
+
+
+def build_docinfo_page_maps(docinfo):
+    json_range_to_page = {}
+    png_range_to_page = {}
+    for item in (docinfo or {}).get("bcsParam") or []:
+        try:
+            page = int(item.get("page") or 0)
+        except Exception:
+            page = 0
+        if not page:
+            continue
+        merge_range = parse_range_value(item.get("merge"))
+        if merge_range:
+            json_range_to_page[merge_range] = page
+        png_range = zoom_png_range(item.get("zoom"))
+        if png_range:
+            png_range_to_page[png_range] = page
+    return json_range_to_page, png_range_to_page
+
+
+def page_from_docconvert_url(url, json_range_to_page, png_range_to_page):
+    parsed = urlparse(url)
+    range_value = query_range(url)
+    if parsed.path.lower().endswith(".json"):
+        return json_range_to_page.get(range_value)
+    if parsed.path.lower().endswith(".png"):
+        return png_range_to_page.get(range_value)
+    return None
+
+
 def is_docconvert_png_url(url):
     parsed = urlparse(url)
     return (
@@ -409,9 +472,7 @@ def initial_page_urls_from_data(data):
 
 
 async def download_binary(context, url, output_path, referer):
-    response = await context.request.get(url, headers={"Referer": referer})
-    if response.status >= 400:
-        raise RuntimeError(f"HTTP {response.status}: {url[:120]}")
+    response = await request_get_with_retry(context, url, referer)
     output_path.write_bytes(await response.body())
     return output_path
 
@@ -490,6 +551,27 @@ def doc_id_from_data_or_url(data, url):
     return match.group(1) if match else ""
 
 
+def docinfo_document_info(docinfo, fallback_title="百度文库文档"):
+    info = (docinfo or {}).get("docInfo") or {}
+    title = sanitize_filename(info.get("docTitle") or (docinfo or {}).get("seoTitle") or fallback_title)
+    doc_type = str(info.get("docType") or info.get("showDocType") or "").lower()
+    file_type = (info.get("fileType") or DOCINFO_TYPE_MAP.get(doc_type) or doc_type or "").lower()
+    try:
+        page_count = int(info.get("totalPageNum") or info.get("page") or (docinfo or {}).get("freepagenum") or 0)
+    except Exception:
+        page_count = 0
+    return title, file_type, page_count
+
+
+def structured_default_font(file_type, direct=False):
+    normalized = (file_type or "").lower()
+    if normalized in {"excel", "xls", "xlsx"}:
+        return "STSong-Light"
+    if direct and normalized in {"word", "doc", "docx"}:
+        return "STSong-Light"
+    return None
+
+
 def merge_structured_html_urls(payload, doc_id, json_urls, png_urls, font_urls):
     html_urls = None
     if isinstance(payload, dict):
@@ -524,17 +606,41 @@ def initial_structured_resource_urls(data, doc_id):
 
 
 async def download_text(context, url, referer):
-    response = await context.request.get(url, headers={"Referer": referer})
-    if response.status >= 400:
-        raise RuntimeError(f"HTTP {response.status}: {url[:120]}")
+    response = await request_get_with_retry(context, url, referer)
     return decode_response_text(await response.body(), response.headers.get("content-type", ""))
 
 
 async def download_bytes(context, url, referer):
-    response = await context.request.get(url, headers={"Referer": referer})
-    if response.status >= 400:
-        raise RuntimeError(f"HTTP {response.status}: {url[:120]}")
+    response = await request_get_with_retry(context, url, referer)
     return await response.body()
+
+
+async def request_get_with_retry(context, url, referer, timeout_ms=RESOURCE_REQUEST_TIMEOUT_MS, retries=RESOURCE_REQUEST_RETRIES):
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            response = await context.request.get(url, headers={"Referer": referer}, timeout=timeout_ms)
+            if response.status < 400:
+                return response
+            last_error = RuntimeError(f"HTTP {response.status}: {url[:120]}")
+        except Exception as exc:
+            last_error = exc
+        if attempt < retries:
+            await asyncio.sleep(0.5 * (attempt + 1))
+    raise last_error
+
+
+def clean_docinfo_text(text):
+    return re.sub(r"^/\*\*/", "", (text or "").strip())
+
+
+async def fetch_docinfo(context, doc_id, referer):
+    if not doc_id:
+        return None
+    url = f"https://wenku.baidu.com/api/doc/getdocinfo?callback=cb&doc_id={doc_id}"
+    response = await request_get_with_retry(context, url, referer)
+    text = decode_response_text(await response.body(), response.headers.get("content-type", ""))
+    return json.loads(json_callback_body(clean_docinfo_text(text)))
 
 
 async def wait_for_pending_response_tasks(pending_response_tasks):
@@ -555,14 +661,17 @@ async def collect_structured_resources(
 ):
     required_png_pages = set(required_png_pages or [])
     required_font_pages = set(required_font_pages or [])
+    started_at = time.monotonic()
     await click_read_more(page, max_clicks=8)
-    for round_index in range(1, 12):
+    for round_index in range(1, STRUCTURED_CAPTURE_ROUNDS + 1):
         await wait_for_pending_response_tasks(pending_response_tasks)
         has_json = all(index in json_urls for index in range(1, page_count + 1))
         has_png = all(index in png_urls for index in required_png_pages)
         has_font = all(index in font_urls for index in required_font_pages)
         if has_json and has_png and has_font:
             break
+        if time.monotonic() - started_at > STRUCTURED_CAPTURE_DEADLINE_SECONDS:
+            raise StructuredResourceNotUsable("文档资源准备超时")
         await scroll_to_load(page, rounds=10, pixels=2000, delay_ms=240)
         await page.wait_for_timeout(900)
         emit_progress(progress, f"资源准备 {round_index}: {len(json_urls)}/{page_count}")
@@ -580,12 +689,25 @@ def merge_page_pdfs(page_pdfs, output_pdf):
         merger.close()
 
 
-async def process_structured_document(context, page, page_count, temp_dir, output_pdf, data, file_type, progress=None, source_url=None):
+async def process_structured_document(
+    context,
+    page,
+    page_count,
+    temp_dir,
+    output_pdf,
+    data,
+    file_type,
+    progress=None,
+    source_url=None,
+    docinfo=None,
+    direct=False,
+):
     doc_id = doc_id_from_data_or_url(data, source_url or page.url)
     if not doc_id:
         raise StructuredResourceNotUsable("缺少文档 ID，无法进行结构化处理")
 
     json_urls, png_urls, font_urls = initial_structured_resource_urls(data, doc_id)
+    json_range_to_page, png_range_to_page = build_docinfo_page_maps(docinfo)
     pending_response_tasks = set()
 
     async def handle_response(response):
@@ -594,11 +716,11 @@ async def process_structured_document(context, page, page_count, temp_dir, outpu
             if "ndocview/readerinfo" in url:
                 merge_structured_html_urls(await response.json(), doc_id, json_urls, png_urls, font_urls)
             elif "docconvert" in url and ".json" in url:
-                page_index = page_index_from_resource_url(url)
+                page_index = page_from_docconvert_url(url, json_range_to_page, png_range_to_page) or page_index_from_resource_url(url)
                 if page_index:
                     json_urls.setdefault(page_index, url)
             elif "docconvert" in url and ".png" in url:
-                page_index = page_index_from_resource_url(url)
+                page_index = page_from_docconvert_url(url, json_range_to_page, png_range_to_page) or page_index_from_resource_url(url)
                 if page_index:
                     png_urls.setdefault(page_index, url)
             elif "wkretype.bdimg.com/retype/pipe/" in url and "t=ttf" in url:
@@ -642,8 +764,7 @@ async def process_structured_document(context, page, page_count, temp_dir, outpu
     if missing_json:
         raise StructuredResourceNotUsable(f"结构化资源不完整，缺少页面：{missing_json[:10]}")
 
-    use_default_font = file_type in {"excel", "xls", "xlsx"}
-    default_font = "STSong-Light" if use_default_font else None
+    default_font = structured_default_font(file_type, direct=direct)
     emit_progress(progress, f"页面资源准备完成，共 {page_count} 页")
 
     required_png_pages = set()
@@ -656,7 +777,7 @@ async def process_structured_document(context, page, page_count, temp_dir, outpu
         needs = structured_page_resource_needs(page_data)
         if needs["image"]:
             required_png_pages.add(index)
-        if needs["font"] and not use_default_font:
+        if needs["font"] and not default_font:
             required_font_pages.add(index)
 
     missing_png = [index for index in sorted(required_png_pages) if index not in png_urls]
@@ -1172,21 +1293,66 @@ async def convert_in_context(browser_context, url, cookie_text, temp_dir, output
     await browser_context.add_cookies(parse_cookie_header(cookie_text))
 
     emit_progress(progress, "正在进入文档空间")
-    await page.goto(url_with_query_params(url, edtMode=2), wait_until="domcontentloaded", timeout=60000)
-    await safe_wait(page)
     emit_progress(progress, "正在读取文档信息")
 
-    html = await page.content()
-    data = extract_page_data(html)
-    if not data:
-        raise RuntimeError("Cannot find pageData in document page")
+    data = None
+    tpl_key = ""
+    direct_docinfo = None
+    doc_id = doc_id_from_data_or_url({}, url)
+    if doc_id:
+        try:
+            direct_docinfo = await fetch_docinfo(browser_context, doc_id, url)
+        except Exception:
+            direct_docinfo = None
 
-    title = title_from_page_data(data, await page.title())
-    _, _, file_type, tpl_key, page_count = reader_info(data)
+    if direct_docinfo:
+        title, file_type, page_count = docinfo_document_info(direct_docinfo)
+    else:
+        await page.goto(url_with_query_params(url, edtMode=2), wait_until="domcontentloaded", timeout=60000)
+        await safe_wait(page)
+        html = await page.content()
+        data = extract_page_data(html)
+        if not data:
+            raise RuntimeError("Cannot find pageData in document page")
+        title = title_from_page_data(data, await page.title())
+        _, _, file_type, tpl_key, page_count = reader_info(data)
+
     output_pdf = output_dir / f"{title}.pdf"
 
     emit_progress(progress, f"文档名称：{title}")
     emit_progress(progress, f"文档页数：{page_count or 'unknown'}")
+
+    if direct_docinfo and file_type in DIRECT_STRUCTURED_TYPES:
+        emit_progress(progress, "已选择最佳处理方案")
+        try:
+            result = await process_structured_document(
+                browser_context,
+                page,
+                page_count,
+                temp_dir,
+                output_pdf,
+                {},
+                file_type,
+                progress=progress,
+                source_url=url,
+                docinfo=direct_docinfo,
+                direct=True,
+            )
+            emit_progress(progress, f"最终文件已生成：{output_pdf.name}")
+            return {"output": str(output_pdf), **result}
+        except StructuredResourceNotUsable:
+            emit_progress(progress, "正在切换备用处理方案")
+
+    if data is None:
+        await page.goto(url_with_query_params(url, edtMode=2), wait_until="domcontentloaded", timeout=60000)
+        await safe_wait(page)
+        html = await page.content()
+        data = extract_page_data(html)
+        if not data:
+            raise RuntimeError("Cannot find pageData in document page")
+        _, _, loaded_file_type, tpl_key, loaded_page_count = reader_info(data)
+        file_type = loaded_file_type or file_type
+        page_count = loaded_page_count or page_count
 
     if file_type in {"ppt", "pptx"} or tpl_key == "new_view":
         emit_progress(progress, "已选择最佳处理方案")
@@ -1204,6 +1370,7 @@ async def convert_in_context(browser_context, url, cookie_text, temp_dir, output
                 file_type,
                 progress=progress,
                 source_url=url,
+                docinfo=direct_docinfo,
             )
         except StructuredResourceNotUsable:
             emit_progress(progress, "正在切换备用处理方案")
@@ -1236,6 +1403,7 @@ async def convert_in_context(browser_context, url, cookie_text, temp_dir, output
                 file_type,
                 progress=progress,
                 source_url=url,
+                docinfo=direct_docinfo,
             )
         except StructuredResourceNotUsable:
             emit_progress(progress, "正在切换备用处理方案")
@@ -1268,6 +1436,7 @@ async def convert_in_context(browser_context, url, cookie_text, temp_dir, output
                 file_type,
                 progress=progress,
                 source_url=url,
+                docinfo=direct_docinfo,
             )
         except StructuredResourceNotUsable:
             emit_progress(progress, "正在切换备用处理方案")

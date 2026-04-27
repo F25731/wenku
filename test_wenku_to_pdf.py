@@ -18,9 +18,13 @@ from wenku_to_pdf import (
     is_mostly_blank_image,
     json_callback_body,
     merge_structured_html_urls,
+    build_docinfo_page_maps,
+    docinfo_document_info,
+    page_from_docconvert_url,
     page_image_ready,
     page_index_from_font_url,
     page_index_from_resource_url,
+    structured_default_font,
     structured_page_needs_image,
     structured_page_needs_font,
     structured_page_resource_needs,
@@ -210,6 +214,55 @@ class StructuredResourceTest(unittest.TestCase):
         self.assertEqual(page_index_from_resource_url("https://x/docconvert/hash/0.json?x=1"), 1)
         self.assertEqual(page_index_from_resource_url("https://x/docconvert/hash/11.png?x=1"), 12)
         self.assertEqual(page_index_from_font_url("https://wkretype.bdimg.com/retype/pipe/id?pn=8&t=ttf"), 8)
+
+    def test_maps_docinfo_ranges_to_page_numbers(self):
+        docinfo = {
+            "bcsParam": [
+                {"page": "1", "merge": "0-65911", "zoom": "&png=0-31224"},
+                {"page": "2", "merge": "65912-144653", "zoom": "&png=31225-70000"},
+            ]
+        }
+
+        json_ranges, png_ranges = build_docinfo_page_maps(docinfo)
+
+        self.assertEqual(json_ranges[(0, 65911)], 1)
+        self.assertEqual(json_ranges[(65912, 144653)], 2)
+        self.assertEqual(png_ranges[(31225, 70000)], 2)
+
+    def test_reads_page_index_from_docinfo_range_before_path_number(self):
+        json_ranges = {(65912, 144653): 2}
+        png_ranges = {(31225, 70000): 2}
+
+        self.assertEqual(
+            page_from_docconvert_url(
+                "https://wkbjcloudbos.bdimg.com/v1/docconvert475/wk/hash/0.json?x-bce-range=65912-144653",
+                json_ranges,
+                png_ranges,
+            ),
+            2,
+        )
+        self.assertEqual(
+            page_from_docconvert_url(
+                "https://wkbjcloudbos.bdimg.com/v1/docconvert475/wk/hash/0.png?x-bce-range=31225-70000",
+                json_ranges,
+                png_ranges,
+            ),
+            2,
+        )
+
+    def test_reads_docinfo_title_type_and_page_count(self):
+        title, file_type, page_count = docinfo_document_info(
+            {"docInfo": {"docTitle": "投资学", "docType": "1", "totalPageNum": "47"}},
+            fallback_title="fallback",
+        )
+
+        self.assertEqual(title, "投资学")
+        self.assertEqual(file_type, "word")
+        self.assertEqual(page_count, 47)
+
+    def test_direct_word_uses_cjk_default_font_to_avoid_bad_embedded_fonts(self):
+        self.assertEqual(structured_default_font("word", direct=True), "STSong-Light")
+        self.assertIsNone(structured_default_font("word", direct=False))
 
     def test_merges_readerinfo_html_urls_by_page_index(self):
         json_urls = {}
