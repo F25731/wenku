@@ -316,10 +316,10 @@ class StructuredResourceTest(unittest.TestCase):
         self.assertIn("wkQuery=math", url)
 
     def test_readerinfo_race_delays_are_staggered_from_zero(self):
-        self.assertEqual(parse_readerinfo_race_delays("10,20"), (0.0, 10.0, 20.0))
+        self.assertEqual(parse_readerinfo_race_delays("5,10"), (0.0, 5.0, 10.0))
 
     def test_readerinfo_race_delays_ignore_bad_and_duplicate_values(self):
-        self.assertEqual(parse_readerinfo_race_delays("0,10,bad,10,-1,20"), (0.0, 10.0, 20.0))
+        self.assertEqual(parse_readerinfo_race_delays("0,5,bad,5,-1,10"), (0.0, 5.0, 10.0))
 
     def test_readerinfo_font_urls_prefer_store_id(self):
         json_urls = {}
