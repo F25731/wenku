@@ -39,6 +39,7 @@ READERINFO_RACE_DELAY_TEXT = os.environ.get("WENKU_READERINFO_RACE_DELAYS", "0,5
 READERINFO_RACE_TIMEOUT_SECONDS = float(os.environ.get("WENKU_READERINFO_RACE_TIMEOUT_SECONDS", "40"))
 READERINFO_TOKEN_TIMEOUT_SECONDS = float(os.environ.get("WENKU_READERINFO_TOKEN_TIMEOUT_SECONDS", "15"))
 DIRECT_STRUCTURED_TYPES = {"word", "doc", "docx", "pdf"}
+DIRECT_STRUCTURED_FALLBACK_TYPES = {"", "0", "txt", "html"}
 DOCINFO_TYPE_MAP = {
     "1": "word",
     "2": "excel",
@@ -1992,8 +1993,17 @@ async def ensure_rendered_document_data(page, url, document):
     return document
 
 
+def can_try_direct_structured_document(document):
+    if not document.get("docinfo") or not document.get("page_count"):
+        return False
+    file_type = document.get("file_type") or ""
+    if file_type in {"ppt", "pptx", "excel", "xls", "xlsx"}:
+        return False
+    return file_type in DIRECT_STRUCTURED_TYPES | DIRECT_STRUCTURED_FALLBACK_TYPES
+
+
 async def try_direct_structured_document(browser_context, page, temp_dir, output_pdf, document, url, progress=None):
-    if not document["docinfo"] or document["file_type"] not in DIRECT_STRUCTURED_TYPES:
+    if not can_try_direct_structured_document(document):
         return None
 
     try:

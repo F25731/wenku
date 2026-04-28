@@ -20,6 +20,7 @@ from wenku_to_pdf import (
     json_callback_body,
     build_readerinfo_url,
     build_public_readerinfo_url,
+    can_try_direct_structured_document,
     parse_readerinfo_race_delays,
     merge_structured_html_urls,
     merge_page_image_urls_from_readerinfo,
@@ -271,6 +272,16 @@ class StructuredResourceTest(unittest.TestCase):
     def test_direct_word_uses_cjk_default_font_to_avoid_bad_embedded_fonts(self):
         self.assertEqual(structured_default_font("word", direct=True), "STSong-Light")
         self.assertIsNone(structured_default_font("word", direct=False))
+
+    def test_unknown_docinfo_type_can_try_direct_reader_endpoint(self):
+        document = {"docinfo": {"docInfo": {"docTitle": "x"}}, "file_type": "0", "page_count": 96}
+
+        self.assertTrue(can_try_direct_structured_document(document))
+
+    def test_excel_keeps_dedicated_handling(self):
+        document = {"docinfo": {"docInfo": {"docTitle": "x"}}, "file_type": "xlsx", "page_count": 1}
+
+        self.assertFalse(can_try_direct_structured_document(document))
 
     def test_normalizes_bullet_for_cjk_pdf_font(self):
         self.assertEqual(normalize_text_for_pdf("威廉•F•夏普", default_font="STSong-Light"), "威廉·F·夏普")
