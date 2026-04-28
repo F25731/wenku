@@ -34,6 +34,7 @@ RESOURCE_REQUEST_TIMEOUT_MS = int(os.environ.get("WENKU_RESOURCE_REQUEST_TIMEOUT
 RESOURCE_REQUEST_RETRIES = int(os.environ.get("WENKU_RESOURCE_REQUEST_RETRIES", "2"))
 STRUCTURED_CAPTURE_ROUNDS = int(os.environ.get("WENKU_STRUCTURED_CAPTURE_ROUNDS", "12"))
 STRUCTURED_CAPTURE_DEADLINE_SECONDS = float(os.environ.get("WENKU_STRUCTURED_CAPTURE_DEADLINE_SECONDS", "150"))
+READERINFO_PAGE_WINDOW = int(os.environ.get("WENKU_READERINFO_PAGE_WINDOW", "200"))
 DIRECT_STRUCTURED_TYPES = {"word", "doc", "docx", "pdf"}
 DOCINFO_TYPE_MAP = {
     "1": "word",
@@ -471,6 +472,34 @@ def initial_page_urls_from_data(data):
     return urls_by_page
 
 
+def page_index_from_zoom_url(url):
+    value = (parse_qs(urlparse(url).query).get("pn") or [""])[0]
+    return int(value) if str(value).isdigit() else None
+
+
+def merge_page_image_urls_from_readerinfo(payload, urls_by_page):
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    html_urls = data.get("htmlUrls") if isinstance(data, dict) else None
+    if isinstance(html_urls, list):
+        for url in html_urls:
+            if not isinstance(url, str):
+                continue
+            page_index = page_index_from_zoom_url(url)
+            if page_index:
+                urls_by_page[page_index] = url
+    elif isinstance(html_urls, dict):
+        for key in ("png", "jpg", "jpeg", "image"):
+            for item in html_urls.get(key, []) or []:
+                if not isinstance(item, dict) or not item.get("pageLoadUrl"):
+                    continue
+                try:
+                    page_index = int(item.get("pageIndex") or 0)
+                except Exception:
+                    page_index = 0
+                if page_index:
+                    urls_by_page[page_index] = item["pageLoadUrl"]
+
+
 async def download_binary(context, url, output_path, referer):
     response = await request_get_with_retry(context, url, referer)
     output_path.write_bytes(await response.body())
@@ -574,7 +603,11 @@ def structured_default_font(file_type, direct=False):
 
 def merge_structured_html_urls(payload, doc_id, json_urls, png_urls, font_urls):
     html_urls = None
+    font_doc_id = doc_id
     if isinstance(payload, dict):
+        source = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        if isinstance(source, dict):
+            font_doc_id = source.get("storeId") or source.get("docId") or doc_id
         if isinstance(payload.get("htmlUrls"), dict):
             html_urls = payload["htmlUrls"]
         elif isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("htmlUrls"), dict):
@@ -592,7 +625,7 @@ def merge_structured_html_urls(payload, doc_id, json_urls, png_urls, font_urls):
         page_index = int(item.get("pageIndex") or 0)
         if page_index and doc_id:
             font_urls[page_index] = (
-                f"https://wkretype.bdimg.com/retype/pipe/{doc_id}"
+                f"https://wkretype.bdimg.com/retype/pipe/{font_doc_id}"
                 f"?pn={page_index}&t=ttf&rn=1&v=6{item.get('param', '')}"
             )
 
@@ -615,11 +648,21 @@ async def download_bytes(context, url, referer):
     return await response.body()
 
 
-async def request_get_with_retry(context, url, referer, timeout_ms=RESOURCE_REQUEST_TIMEOUT_MS, retries=RESOURCE_REQUEST_RETRIES):
+async def request_get_with_retry(
+    context,
+    url,
+    referer,
+    timeout_ms=RESOURCE_REQUEST_TIMEOUT_MS,
+    retries=RESOURCE_REQUEST_RETRIES,
+    extra_headers=None,
+):
     last_error = None
+    headers = {"Referer": referer}
+    if extra_headers:
+        headers.update(extra_headers)
     for attempt in range(retries + 1):
         try:
-            response = await context.request.get(url, headers={"Referer": referer}, timeout=timeout_ms)
+            response = await context.request.get(url, headers=headers, timeout=timeout_ms)
             if response.status < 400:
                 return response
             last_error = RuntimeError(f"HTTP {response.status}: {url[:120]}")
@@ -643,9 +686,64 @@ async def fetch_docinfo(context, doc_id, referer):
     return json.loads(json_callback_body(clean_docinfo_text(text)))
 
 
+def build_readerinfo_url(doc_id, start_page, page_window, source_url=None):
+    params = {
+        "doc_id": doc_id,
+        "docId": doc_id,
+        "type": "html",
+        "clientType": "1",
+        "pn": str(start_page),
+        "t": str(int(time.time() * 1000)),
+        "isFromBdSearch": "0",
+        "srcRef": "",
+        "rn": str(page_window),
+        "powerId": "2",
+        "bizName": "mainPc",
+    }
+    if source_url:
+        source_query = parse_qs(urlparse(source_url).query)
+        if source_query.get("wkQuery"):
+            params["wkQuery"] = source_query["wkQuery"][0]
+    return "https://wenku.baidu.com/ndocview/readerinfo?" + urlencode(params)
+
+
+def readerinfo_extra_headers(readerinfo_auth):
+    acs_token = (readerinfo_auth or {}).get("acs_token")
+    if not acs_token:
+        return None
+    return {
+        "acs-token": acs_token,
+        "x-requested-with": "XMLHttpRequest",
+        "accept": "application/json, text/plain, */*",
+    }
+
+
+async def fetch_readerinfo_payload(context, doc_id, start_page, page_window, source_url, readerinfo_auth):
+    headers = readerinfo_extra_headers(readerinfo_auth)
+    if not headers:
+        return None
+    referer = readerinfo_auth.get("referer") or source_url
+    url = build_readerinfo_url(doc_id, start_page, page_window, source_url)
+    response = await request_get_with_retry(context, url, referer, extra_headers=headers)
+    text = decode_response_text(await response.body(), response.headers.get("content-type", ""))
+    payload = json.loads(json_callback_body(text))
+    status = payload.get("status") if isinstance(payload, dict) else {}
+    if isinstance(status, dict) and status.get("msg") not in (None, "success"):
+        return None
+    return payload
+
+
 async def wait_for_pending_response_tasks(pending_response_tasks):
     if pending_response_tasks:
         await asyncio.gather(*list(pending_response_tasks), return_exceptions=True)
+
+
+async def wait_for_pending_tasks(*task_sets):
+    pending = []
+    for task_set in task_sets:
+        pending.extend(list(task_set or []))
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 async def collect_structured_resources(
@@ -692,6 +790,8 @@ def merge_page_pdfs(page_pdfs, output_pdf):
 def bind_structured_resource_collector(page, doc_id, json_urls, png_urls, font_urls, docinfo=None):
     json_range_to_page, png_range_to_page = build_docinfo_page_maps(docinfo)
     pending_response_tasks = set()
+    pending_request_tasks = set()
+    readerinfo_auth = {}
 
     async def handle_response(response):
         url = response.url
@@ -718,16 +818,35 @@ def bind_structured_resource_collector(page, doc_id, json_urls, png_urls, font_u
         pending_response_tasks.add(task)
         task.add_done_callback(pending_response_tasks.discard)
 
+    async def handle_request(request):
+        if "ndocview/readerinfo" not in request.url:
+            return
+        try:
+            headers = await request.all_headers()
+        except Exception:
+            return
+        acs_token = headers.get("acs-token")
+        if acs_token:
+            readerinfo_auth["acs_token"] = acs_token
+            readerinfo_auth["referer"] = headers.get("referer") or page.url
+
+    def on_request(request):
+        task = asyncio.create_task(handle_request(request))
+        pending_request_tasks.add(task)
+        task.add_done_callback(pending_request_tasks.discard)
+
+    page.on("request", on_request)
     page.on("response", on_response)
-    return pending_response_tasks
+    return pending_response_tasks, pending_request_tasks, readerinfo_auth
 
 
 async def refresh_structured_page_data(page, source_url, data, file_type, page_count, doc_id, json_urls, png_urls, font_urls):
     if not source_url:
         return data, file_type, page_count, doc_id
 
-    await page.goto(url_with_query_params(source_url, edtMode=2), wait_until="domcontentloaded", timeout=60000)
+    await page.goto(source_url, wait_until="domcontentloaded", timeout=60000)
     await safe_wait(page)
+    await exit_editor_mode_if_needed(page)
     loaded_data = extract_page_data(await page.content())
     if not loaded_data:
         return data, file_type, page_count, doc_id
@@ -738,7 +857,74 @@ async def refresh_structured_page_data(page, source_url, data, file_type, page_c
     json_urls.update(initial_json)
     png_urls.update(initial_png)
     font_urls.update(initial_font)
-    return loaded_data, loaded_file_type or file_type, loaded_page_count or page_count, loaded_doc_id
+    resolved_page_count = max(int(page_count or 0), int(loaded_page_count or 0))
+    return loaded_data, loaded_file_type or file_type, resolved_page_count, loaded_doc_id
+
+
+async def trigger_readerinfo_seed(page, pending_response_tasks, pending_request_tasks, readerinfo_auth):
+    if readerinfo_auth.get("acs_token"):
+        return
+    await click_read_more(page, max_clicks=4)
+    for _ in range(6):
+        await wait_for_pending_tasks(pending_response_tasks, pending_request_tasks)
+        if readerinfo_auth.get("acs_token"):
+            return
+        await scroll_to_load(page, rounds=4, pixels=1800, delay_ms=220)
+        await page.wait_for_timeout(500)
+
+
+async def fetch_missing_readerinfo_resources(
+    context,
+    doc_id,
+    page_count,
+    source_url,
+    json_urls,
+    png_urls,
+    font_urls,
+    readerinfo_auth,
+):
+    if not page_count or not readerinfo_auth.get("acs_token"):
+        return
+
+    def missing_pages():
+        return [index for index in range(1, page_count + 1) if index not in json_urls]
+
+    missing = missing_pages()
+    if any(index <= 2 for index in missing):
+        payload = await fetch_readerinfo_payload(context, doc_id, 1, 100, source_url, readerinfo_auth)
+        if payload:
+            merge_structured_html_urls(payload, doc_id, json_urls, png_urls, font_urls)
+
+    missing = [index for index in missing_pages() if index >= 3]
+    while missing:
+        start_page = min(missing)
+        page_window = min(READERINFO_PAGE_WINDOW, page_count - start_page + 1)
+        payload = await fetch_readerinfo_payload(context, doc_id, start_page, page_window, source_url, readerinfo_auth)
+        if not payload:
+            break
+        before = set(json_urls)
+        merge_structured_html_urls(payload, doc_id, json_urls, png_urls, font_urls)
+        missing = [index for index in missing_pages() if index >= 3]
+        if set(json_urls) == before:
+            break
+
+
+async def fetch_missing_readerinfo_page_images(context, doc_id, page_count, source_url, urls_by_page, readerinfo_auth):
+    if not doc_id or not page_count or not readerinfo_auth.get("acs_token"):
+        return
+
+    missing = [index for index in range(1, page_count + 1) if index not in urls_by_page]
+    while missing:
+        start_page = min(missing)
+        page_window = min(READERINFO_PAGE_WINDOW, page_count - start_page + 1)
+        payload = await fetch_readerinfo_payload(context, doc_id, start_page, page_window, source_url, readerinfo_auth)
+        if not payload:
+            break
+        before = set(urls_by_page)
+        merge_page_image_urls_from_readerinfo(payload, urls_by_page)
+        missing = [index for index in range(1, page_count + 1) if index not in urls_by_page]
+        if set(urls_by_page) == before:
+            break
 
 
 async def prepare_structured_json_pages(context, page, page_count, temp_dir, json_urls, default_font):
@@ -836,7 +1022,9 @@ async def process_structured_document(
         raise StructuredResourceNotUsable("缺少文档 ID，无法进行结构化处理")
 
     json_urls, png_urls, font_urls = initial_structured_resource_urls(data, doc_id)
-    pending_response_tasks = bind_structured_resource_collector(page, doc_id, json_urls, png_urls, font_urls, docinfo=docinfo)
+    pending_response_tasks, pending_request_tasks, readerinfo_auth = bind_structured_resource_collector(
+        page, doc_id, json_urls, png_urls, font_urls, docinfo=docinfo
+    )
     data, file_type, page_count, doc_id = await refresh_structured_page_data(
         page,
         source_url,
@@ -853,12 +1041,38 @@ async def process_structured_document(
         raise StructuredResourceNotUsable("缺少页数，无法进行结构化处理")
 
     emit_progress(progress, "正在准备文档资源")
-    await collect_structured_resources(page, page_count, json_urls, png_urls, font_urls, pending_response_tasks, progress=progress)
+    await wait_for_pending_tasks(pending_response_tasks, pending_request_tasks)
+    await trigger_readerinfo_seed(page, pending_response_tasks, pending_request_tasks, readerinfo_auth)
+    await wait_for_pending_tasks(pending_response_tasks, pending_request_tasks)
+    await fetch_missing_readerinfo_resources(
+        context,
+        doc_id,
+        page_count,
+        source_url or page.url,
+        json_urls,
+        png_urls,
+        font_urls,
+        readerinfo_auth,
+    )
     await wait_for_pending_response_tasks(pending_response_tasks)
 
     missing_json = [index for index in range(1, page_count + 1) if index not in json_urls]
     if missing_json:
-        raise StructuredResourceNotUsable(f"结构化资源不完整，缺少页面：{missing_json[:10]}")
+        await collect_structured_resources(page, page_count, json_urls, png_urls, font_urls, pending_response_tasks, progress=progress)
+        await wait_for_pending_tasks(pending_response_tasks, pending_request_tasks)
+        await fetch_missing_readerinfo_resources(
+            context,
+            doc_id,
+            page_count,
+            source_url or page.url,
+            json_urls,
+            png_urls,
+            font_urls,
+            readerinfo_auth,
+        )
+        missing_json = [index for index in range(1, page_count + 1) if index not in json_urls]
+        if missing_json:
+            raise StructuredResourceNotUsable(f"结构化资源不完整，缺少页面：{missing_json[:10]}")
 
     default_font = structured_default_font(file_type, direct=direct)
     emit_progress(progress, f"页面资源准备完成，共 {page_count} 页")
@@ -904,23 +1118,61 @@ async def load_structured_page_data(page, url, fallback_data):
 
 async def process_ppt(context, page, page_count, temp_dir, output_pdf, data, progress=None):
     urls_by_page = dict(initial_page_urls_from_data(data))
+    doc_id = doc_id_from_data_or_url(data, page.url)
+    readerinfo_auth = {}
+    pending_request_tasks = set()
+    pending_response_tasks = set()
     emit_progress(progress, "正在准备演示文档页面")
 
-    def collect_from_response(response):
+    async def handle_response(response):
         url = response.url
-        if "wkretype.bdimg.com/retype/zoom/" not in url:
-            return
-        match = re.search(r"[?&]pn=(\d+)", url)
-        if match:
-            urls_by_page[int(match.group(1))] = url
+        try:
+            if "wkretype.bdimg.com/retype/zoom/" in url:
+                page_index = page_index_from_zoom_url(url)
+                if page_index:
+                    urls_by_page[page_index] = url
+            elif "ndocview/readerinfo" in url:
+                text = decode_response_text(await response.body(), response.headers.get("content-type", ""))
+                merge_page_image_urls_from_readerinfo(json.loads(json_callback_body(text)), urls_by_page)
+        except Exception:
+            pass
 
-    page.on("response", collect_from_response)
+    def on_response(response):
+        task = asyncio.create_task(handle_response(response))
+        pending_response_tasks.add(task)
+        task.add_done_callback(pending_response_tasks.discard)
+
+    async def handle_request(request):
+        if "ndocview/readerinfo" not in request.url:
+            return
+        try:
+            headers = await request.all_headers()
+        except Exception:
+            return
+        acs_token = headers.get("acs-token")
+        if acs_token:
+            readerinfo_auth["acs_token"] = acs_token
+            readerinfo_auth["referer"] = headers.get("referer") or page.url
+
+    def on_request(request):
+        task = asyncio.create_task(handle_request(request))
+        pending_request_tasks.add(task)
+        task.add_done_callback(pending_request_tasks.discard)
+
+    page.on("request", on_request)
+    page.on("response", on_response)
     await scroll_to_load(page, rounds=8)
     await click_read_more(page, max_clicks=10)
+    await wait_for_pending_tasks(pending_response_tasks, pending_request_tasks)
+    await fetch_missing_readerinfo_page_images(context, doc_id, page_count, page.url, urls_by_page, readerinfo_auth)
     for _ in range(10):
         before = len(urls_by_page)
+        if page_count and len(urls_by_page) >= page_count:
+            break
         await scroll_to_load(page, rounds=35, pixels=1800)
         await click_read_more(page, max_clicks=1)
+        await wait_for_pending_tasks(pending_response_tasks, pending_request_tasks)
+        await fetch_missing_readerinfo_page_images(context, doc_id, page_count, page.url, urls_by_page, readerinfo_auth)
         if page_count and len(urls_by_page) >= page_count:
             break
         if len(urls_by_page) <= before:

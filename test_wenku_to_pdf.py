@@ -18,7 +18,9 @@ from wenku_to_pdf import (
     full_page_png_looks_complete,
     is_mostly_blank_image,
     json_callback_body,
+    build_readerinfo_url,
     merge_structured_html_urls,
+    merge_page_image_urls_from_readerinfo,
     build_docinfo_page_maps,
     docinfo_document_info,
     page_from_docconvert_url,
@@ -296,6 +298,59 @@ class StructuredResourceTest(unittest.TestCase):
         self.assertEqual(json_urls[3], "https://example.test/2.json")
         self.assertEqual(png_urls[3], "https://example.test/2.png")
         self.assertIn("pn=3", font_urls[3])
+
+    def test_readerinfo_url_requests_large_page_window(self):
+        url = build_readerinfo_url(
+            "doc123",
+            3,
+            200,
+            "https://wenku.baidu.com/view/doc123.html?wkQuery=math&chatType=chat",
+        )
+
+        self.assertIn("docId=doc123", url)
+        self.assertIn("pn=3", url)
+        self.assertIn("rn=200", url)
+        self.assertIn("powerId=2", url)
+        self.assertIn("bizName=mainPc", url)
+        self.assertIn("wkQuery=math", url)
+
+    def test_readerinfo_font_urls_prefer_store_id(self):
+        json_urls = {}
+        png_urls = {}
+        font_urls = {}
+        merge_structured_html_urls(
+            {
+                "data": {
+                    "storeId": "store123",
+                    "htmlUrls": {
+                        "ttf": [{"pageIndex": 8, "param": "&md5sum=abc&range=1-2"}],
+                    },
+                }
+            },
+            "doc123",
+            json_urls,
+            png_urls,
+            font_urls,
+        )
+
+        self.assertIn("/store123?", font_urls[8])
+
+    def test_merges_ppt_readerinfo_image_list_by_url_page_number(self):
+        urls_by_page = {1: "https://example.test/1.jpg"}
+        merge_page_image_urls_from_readerinfo(
+            {
+                "data": {
+                    "htmlUrls": [
+                        "https://wkretype.bdimg.com/retype/zoom/store?pn=21&o=jpg_6",
+                        "https://wkretype.bdimg.com/retype/zoom/store?pn=22&o=jpg_6",
+                    ]
+                }
+            },
+            urls_by_page,
+        )
+
+        self.assertEqual(urls_by_page[21], "https://wkretype.bdimg.com/retype/zoom/store?pn=21&o=jpg_6")
+        self.assertEqual(urls_by_page[22], "https://wkretype.bdimg.com/retype/zoom/store?pn=22&o=jpg_6")
 
 
 if __name__ == "__main__":
