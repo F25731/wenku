@@ -35,6 +35,8 @@ RESOURCE_REQUEST_RETRIES = int(os.environ.get("WENKU_RESOURCE_REQUEST_RETRIES", 
 STRUCTURED_CAPTURE_ROUNDS = int(os.environ.get("WENKU_STRUCTURED_CAPTURE_ROUNDS", "12"))
 STRUCTURED_CAPTURE_DEADLINE_SECONDS = float(os.environ.get("WENKU_STRUCTURED_CAPTURE_DEADLINE_SECONDS", "150"))
 READERINFO_PAGE_WINDOW = int(os.environ.get("WENKU_READERINFO_PAGE_WINDOW", "200"))
+READERINFO_RACE_DELAY_TEXT = os.environ.get("WENKU_READERINFO_RACE_DELAYS", "0,10,20")
+READERINFO_RACE_TIMEOUT_SECONDS = float(os.environ.get("WENKU_READERINFO_RACE_TIMEOUT_SECONDS", "60"))
 DIRECT_STRUCTURED_TYPES = {"word", "doc", "docx", "pdf"}
 DOCINFO_TYPE_MAP = {
     "1": "word",
@@ -139,6 +141,21 @@ def url_with_query_params(url, **params):
     for key, value in params.items():
         query[key] = str(value)
     return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def parse_readerinfo_race_delays(value):
+    delays = {0.0}
+    for item in str(value or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            delay = float(item)
+        except ValueError:
+            continue
+        if delay >= 0:
+            delays.add(delay)
+    return tuple(sorted(delays))
 
 
 def find_json_object_after_marker(html, marker):
@@ -787,11 +804,11 @@ def merge_page_pdfs(page_pdfs, output_pdf):
         merger.close()
 
 
-def bind_structured_resource_collector(page, doc_id, json_urls, png_urls, font_urls, docinfo=None):
+def bind_structured_resource_collector(page, doc_id, json_urls, png_urls, font_urls, docinfo=None, readerinfo_auth=None):
     json_range_to_page, png_range_to_page = build_docinfo_page_maps(docinfo)
     pending_response_tasks = set()
     pending_request_tasks = set()
-    readerinfo_auth = {}
+    readerinfo_auth = readerinfo_auth if readerinfo_auth is not None else {}
 
     async def handle_response(response):
         url = response.url
@@ -861,16 +878,119 @@ async def refresh_structured_page_data(page, source_url, data, file_type, page_c
     return loaded_data, loaded_file_type or file_type, resolved_page_count, loaded_doc_id
 
 
-async def trigger_readerinfo_seed(page, pending_response_tasks, pending_request_tasks, readerinfo_auth):
+async def trigger_readerinfo_seed(
+    page,
+    pending_response_tasks,
+    pending_request_tasks,
+    readerinfo_auth,
+    stop_event=None,
+    max_seconds=READERINFO_RACE_TIMEOUT_SECONDS,
+):
     if readerinfo_auth.get("acs_token"):
         return
-    await click_read_more(page, max_clicks=4)
-    for _ in range(6):
+    started_at = time.monotonic()
+    try:
+        await click_read_more(page, max_clicks=4)
+    except Exception:
+        pass
+    while time.monotonic() - started_at < max_seconds:
+        if stop_event and stop_event.is_set():
+            return
         await wait_for_pending_tasks(pending_response_tasks, pending_request_tasks)
         if readerinfo_auth.get("acs_token"):
             return
-        await scroll_to_load(page, rounds=4, pixels=1800, delay_ms=220)
-        await page.wait_for_timeout(500)
+        try:
+            await scroll_to_load(page, rounds=4, pixels=1800, delay_ms=220)
+            await page.wait_for_timeout(500)
+        except Exception:
+            return
+
+
+async def race_readerinfo_seed(
+    context,
+    main_page,
+    source_url,
+    doc_id,
+    json_urls,
+    png_urls,
+    font_urls,
+    docinfo,
+    pending_response_tasks,
+    pending_request_tasks,
+    readerinfo_auth,
+):
+    if readerinfo_auth.get("acs_token") or not source_url:
+        return
+
+    delays = parse_readerinfo_race_delays(READERINFO_RACE_DELAY_TEXT)
+    stop_event = asyncio.Event()
+    extra_pages = []
+    tasks = []
+
+    async def run_probe(delay, candidate_index):
+        if delay:
+            await asyncio.sleep(delay)
+        if stop_event.is_set() or readerinfo_auth.get("acs_token"):
+            return
+
+        if candidate_index == 0:
+            probe_page = main_page
+            probe_response_tasks = pending_response_tasks
+            probe_request_tasks = pending_request_tasks
+        else:
+            probe_page = await context.new_page()
+            extra_pages.append(probe_page)
+            probe_response_tasks, probe_request_tasks, _ = bind_structured_resource_collector(
+                probe_page,
+                doc_id,
+                json_urls,
+                png_urls,
+                font_urls,
+                docinfo=docinfo,
+                readerinfo_auth=readerinfo_auth,
+            )
+            try:
+                await probe_page.goto(source_url, wait_until="domcontentloaded", timeout=60000)
+                await safe_wait(probe_page)
+                await exit_editor_mode_if_needed(probe_page)
+            except Exception:
+                return
+
+        await trigger_readerinfo_seed(
+            probe_page,
+            probe_response_tasks,
+            probe_request_tasks,
+            readerinfo_auth,
+            stop_event=stop_event,
+            max_seconds=max(1.0, READERINFO_RACE_TIMEOUT_SECONDS - delay),
+        )
+        await wait_for_pending_tasks(probe_response_tasks, probe_request_tasks)
+        if readerinfo_auth.get("acs_token"):
+            stop_event.set()
+
+    for candidate_index, delay in enumerate(delays):
+        tasks.append(asyncio.create_task(run_probe(delay, candidate_index)))
+
+    started_at = time.monotonic()
+    while time.monotonic() - started_at < READERINFO_RACE_TIMEOUT_SECONDS:
+        if readerinfo_auth.get("acs_token"):
+            stop_event.set()
+            break
+        if all(task.done() for task in tasks):
+            break
+        await asyncio.sleep(0.25)
+
+    stop_event.set()
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    for probe_page in extra_pages:
+        try:
+            await probe_page.close()
+        except Exception:
+            pass
 
 
 async def fetch_missing_readerinfo_resources(
@@ -1042,7 +1162,19 @@ async def process_structured_document(
 
     emit_progress(progress, "正在准备文档资源")
     await wait_for_pending_tasks(pending_response_tasks, pending_request_tasks)
-    await trigger_readerinfo_seed(page, pending_response_tasks, pending_request_tasks, readerinfo_auth)
+    await race_readerinfo_seed(
+        context,
+        page,
+        source_url or page.url,
+        doc_id,
+        json_urls,
+        png_urls,
+        font_urls,
+        docinfo,
+        pending_response_tasks,
+        pending_request_tasks,
+        readerinfo_auth,
+    )
     await wait_for_pending_tasks(pending_response_tasks, pending_request_tasks)
     await fetch_missing_readerinfo_resources(
         context,

@@ -19,6 +19,7 @@ from wenku_to_pdf import (
     is_mostly_blank_image,
     json_callback_body,
     build_readerinfo_url,
+    parse_readerinfo_race_delays,
     merge_structured_html_urls,
     merge_page_image_urls_from_readerinfo,
     build_docinfo_page_maps,
@@ -313,6 +314,12 @@ class StructuredResourceTest(unittest.TestCase):
         self.assertIn("powerId=2", url)
         self.assertIn("bizName=mainPc", url)
         self.assertIn("wkQuery=math", url)
+
+    def test_readerinfo_race_delays_are_staggered_from_zero(self):
+        self.assertEqual(parse_readerinfo_race_delays("10,20"), (0.0, 10.0, 20.0))
+
+    def test_readerinfo_race_delays_ignore_bad_and_duplicate_values(self):
+        self.assertEqual(parse_readerinfo_race_delays("0,10,bad,10,-1,20"), (0.0, 10.0, 20.0))
 
     def test_readerinfo_font_urls_prefer_store_id(self):
         json_urls = {}
