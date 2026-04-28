@@ -234,11 +234,27 @@ def reader_info(data):
     return reader, doc_info, file_type, tpl_key, page_count
 
 
-async def safe_wait(page, timeout_ms=15000):
+async def wait_for_reader_runtime(page, timeout_ms=12000):
     try:
-        await page.wait_for_load_state("networkidle", timeout=timeout_ms)
+        await page.wait_for_function(
+            """() => Boolean(
+                window.pageData ||
+                (window.paris_2030 && window.paris_2030.getAcsTokenWithAbcliteActiveReport)
+            )""",
+            timeout=timeout_ms,
+        )
+        return True
     except Exception:
-        await page.wait_for_timeout(5000)
+        return False
+
+
+async def safe_wait(page, timeout_ms=8000):
+    if await wait_for_reader_runtime(page, timeout_ms=timeout_ms):
+        return
+    try:
+        await page.wait_for_load_state("networkidle", timeout=3000)
+    except Exception:
+        await page.wait_for_timeout(500)
 
 
 async def click_read_more(page, max_clicks=8):
@@ -920,7 +936,7 @@ async def refresh_structured_page_data(page, source_url, data, file_type, page_c
         return data, file_type, page_count, doc_id
 
     await page.goto(source_url, wait_until="domcontentloaded", timeout=60000)
-    await safe_wait(page)
+    await wait_for_reader_runtime(page)
     await exit_editor_mode_if_needed(page)
     loaded_data = extract_page_data(await page.content())
     if not loaded_data:
@@ -1805,7 +1821,7 @@ async def process_html_screenshots(
 
 async def load_page_data(page, url):
     await page.goto(url_with_query_params(url, edtMode=2), wait_until="domcontentloaded", timeout=60000)
-    await safe_wait(page)
+    await wait_for_reader_runtime(page)
     data = extract_page_data(await page.content())
     if not data:
         raise RuntimeError("Cannot find pageData in document page")
@@ -1985,20 +2001,34 @@ async def convert_in_context(browser_context, url, cookie_text, temp_dir, output
     return {"output": str(output_pdf), **result}
 
 
-async def convert_with_browser(browser, url, cookie_text, output_dir, temp_root=None, keep_temp=False, scale=2.0, progress=None):
+async def convert_with_browser(
+    browser,
+    url,
+    cookie_text,
+    output_dir,
+    temp_root=None,
+    keep_temp=False,
+    scale=2.0,
+    progress=None,
+    browser_context=None,
+    close_context=True,
+):
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     temp_parent = Path(temp_root).resolve() if temp_root else None
     temp_dir = Path(tempfile.mkdtemp(prefix="wenku_to_pdf_", dir=str(temp_parent) if temp_parent else None))
-    browser_context = None
+    owned_context = None
     try:
-        browser_context = await browser.new_context(**browser_context_options(scale))
-        return await convert_in_context(browser_context, url, cookie_text, temp_dir, output_dir, progress=progress)
+        active_context = browser_context
+        if active_context is None:
+            owned_context = await browser.new_context(**browser_context_options(scale))
+            active_context = owned_context
+        return await convert_in_context(active_context, url, cookie_text, temp_dir, output_dir, progress=progress)
     finally:
-        if browser_context:
+        if owned_context or (browser_context and close_context):
             try:
-                await browser_context.close()
+                await (owned_context or browser_context).close()
             except Exception:
                 pass
         if keep_temp:

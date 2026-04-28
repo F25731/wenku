@@ -205,6 +205,37 @@ class WorkerBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             app.convert_with_browser = old_convert_with_browser
             runtime.loop.close()
 
+    async def test_worker_reuses_context_for_same_cookie(self):
+        class FakeContext:
+            def __init__(self):
+                self.closed = False
+
+            async def close(self):
+                self.closed = True
+
+        class FakeBrowser:
+            def __init__(self):
+                self.contexts = []
+
+            async def new_context(self, **kwargs):
+                context = FakeContext()
+                self.contexts.append((context, kwargs))
+                return context
+
+        runtime = app.WorkerBrowserRuntime(worker_id=1, restart_after_jobs=20)
+        browser = FakeBrowser()
+        try:
+            first = await runtime.ensure_browser_context(browser, "cookie-a", 2.0)
+            second = await runtime.ensure_browser_context(browser, "cookie-a", 2.0)
+            third = await runtime.ensure_browser_context(browser, "cookie-b", 2.0)
+
+            self.assertIs(first, second)
+            self.assertIsNot(first, third)
+            self.assertTrue(first.closed)
+            self.assertEqual(len(browser.contexts), 2)
+        finally:
+            runtime.loop.close()
+
 
 class TokenBackendTest(unittest.TestCase):
     def setUp(self):

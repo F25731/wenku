@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import queue
@@ -16,7 +17,7 @@ from flask import Flask, jsonify, render_template, request, send_from_directory
 
 from playwright.async_api import async_playwright
 
-from wenku_to_pdf import browser_process_launch_options, convert, convert_with_browser
+from wenku_to_pdf import browser_context_options, browser_process_launch_options, convert, convert_with_browser
 
 
 app = Flask(__name__)
@@ -732,6 +733,9 @@ class WorkerBrowserRuntime:
         self.loop = asyncio.new_event_loop()
         self.playwright = None
         self.browser = None
+        self.browser_context = None
+        self.context_cookie_key = None
+        self.context_scale = None
         self.completed_jobs = 0
 
     @staticmethod
@@ -748,6 +752,14 @@ class WorkerBrowserRuntime:
         return self.browser
 
     async def restart_browser(self):
+        if self.browser_context:
+            try:
+                await self.browser_context.close()
+            except Exception:
+                pass
+        self.browser_context = None
+        self.context_cookie_key = None
+        self.context_scale = None
         if self.browser:
             try:
                 await self.browser.close()
@@ -761,6 +773,33 @@ class WorkerBrowserRuntime:
                 pass
         self.playwright = None
         self.completed_jobs = 0
+
+    @staticmethod
+    def cookie_key(cookie_text):
+        return hashlib.sha256(str(cookie_text or "").encode("utf-8", errors="ignore")).hexdigest()
+
+    async def ensure_browser_context(self, browser, cookie_text, scale):
+        if not hasattr(browser, "new_context"):
+            return None
+
+        cookie_key = self.cookie_key(cookie_text)
+        if (
+            self.browser_context
+            and self.context_cookie_key == cookie_key
+            and self.context_scale == scale
+        ):
+            return self.browser_context
+
+        if self.browser_context:
+            try:
+                await self.browser_context.close()
+            except Exception:
+                pass
+
+        self.browser_context = await browser.new_context(**browser_context_options(scale))
+        self.context_cookie_key = cookie_key
+        self.context_scale = scale
+        return self.browser_context
 
     def request_interrupt(self):
         if self.loop.is_running():
@@ -783,6 +822,14 @@ class WorkerBrowserRuntime:
 
             attempt_kwargs = dict(kwargs)
             attempt_kwargs["progress"] = progress
+            browser_context = await self.ensure_browser_context(
+                browser,
+                attempt_kwargs.get("cookie_text", ""),
+                attempt_kwargs.get("scale", 2.0),
+            )
+            if browser_context:
+                attempt_kwargs["browser_context"] = browser_context
+                attempt_kwargs["close_context"] = False
             try:
                 operation = asyncio.create_task(convert_with_browser(browser=browser, **attempt_kwargs))
                 await asyncio.sleep(0)
