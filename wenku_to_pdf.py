@@ -37,6 +37,7 @@ STRUCTURED_CAPTURE_DEADLINE_SECONDS = float(os.environ.get("WENKU_STRUCTURED_CAP
 READERINFO_PAGE_WINDOW = int(os.environ.get("WENKU_READERINFO_PAGE_WINDOW", "200"))
 READERINFO_RACE_DELAY_TEXT = os.environ.get("WENKU_READERINFO_RACE_DELAYS", "0,5,10")
 READERINFO_RACE_TIMEOUT_SECONDS = float(os.environ.get("WENKU_READERINFO_RACE_TIMEOUT_SECONDS", "40"))
+READERINFO_TOKEN_TIMEOUT_SECONDS = float(os.environ.get("WENKU_READERINFO_TOKEN_TIMEOUT_SECONDS", "15"))
 DIRECT_STRUCTURED_TYPES = {"word", "doc", "docx", "pdf"}
 DOCINFO_TYPE_MAP = {
     "1": "word",
@@ -729,10 +730,67 @@ def readerinfo_extra_headers(readerinfo_auth):
     if not acs_token:
         return None
     return {
-        "acs-token": acs_token,
+        "Acs-Token": acs_token,
         "x-requested-with": "XMLHttpRequest",
         "accept": "application/json, text/plain, */*",
     }
+
+
+def normalize_acs_token(value):
+    if isinstance(value, dict):
+        value = value.get("Acs-Token") or value.get("acs-token") or value.get("token")
+    value = str(value or "").strip()
+    if not value or value.startswith("ERR:"):
+        return ""
+    return value
+
+
+async def read_page_acs_token(page):
+    return normalize_acs_token(
+        await page.evaluate(
+            """async () => {
+                const paris = window.paris_2030;
+                if (!paris || typeof paris.getAcsTokenWithAbcliteActiveReport !== 'function') {
+                    return null;
+                }
+                return await new Promise(resolve => {
+                    let done = false;
+                    const finish = value => {
+                        if (done) return;
+                        done = true;
+                        resolve(value);
+                    };
+                    setTimeout(() => finish(null), 2500);
+                    try {
+                        paris.getAcsTokenWithAbcliteActiveReport(
+                            {subid: 'wenku_pc_readerinfo'},
+                            token => finish(token)
+                        );
+                    } catch (error) {
+                        finish(null);
+                    }
+                });
+            }"""
+        )
+    )
+
+
+async def ensure_readerinfo_auth(page, source_url, readerinfo_auth, timeout_seconds=READERINFO_TOKEN_TIMEOUT_SECONDS):
+    if readerinfo_auth.get("acs_token"):
+        return True
+
+    started_at = time.monotonic()
+    while time.monotonic() - started_at < timeout_seconds:
+        try:
+            token = await read_page_acs_token(page)
+        except Exception:
+            token = ""
+        if token:
+            readerinfo_auth["acs_token"] = token
+            readerinfo_auth["referer"] = page.url or source_url
+            return True
+        await page.wait_for_timeout(350)
+    return False
 
 
 async def fetch_readerinfo_payload(context, doc_id, start_page, page_window, source_url, readerinfo_auth):
@@ -888,6 +946,9 @@ async def trigger_readerinfo_seed(
 ):
     if readerinfo_auth.get("acs_token"):
         return
+    await ensure_readerinfo_auth(page, page.url, readerinfo_auth, timeout_seconds=3)
+    if readerinfo_auth.get("acs_token"):
+        return
     started_at = time.monotonic()
     try:
         await click_read_more(page, max_clicks=4)
@@ -1011,7 +1072,7 @@ async def fetch_missing_readerinfo_resources(
 
     missing = missing_pages()
     if any(index <= 2 for index in missing):
-        payload = await fetch_readerinfo_payload(context, doc_id, 1, 100, source_url, readerinfo_auth)
+        payload = await fetch_readerinfo_payload(context, doc_id, 1, 2, source_url, readerinfo_auth)
         if payload:
             merge_structured_html_urls(payload, doc_id, json_urls, png_urls, font_urls)
 
@@ -1162,19 +1223,21 @@ async def process_structured_document(
 
     emit_progress(progress, "正在准备文档资源")
     await wait_for_pending_tasks(pending_response_tasks, pending_request_tasks)
-    await race_readerinfo_seed(
-        context,
-        page,
-        source_url or page.url,
-        doc_id,
-        json_urls,
-        png_urls,
-        font_urls,
-        docinfo,
-        pending_response_tasks,
-        pending_request_tasks,
-        readerinfo_auth,
-    )
+    await ensure_readerinfo_auth(page, source_url or page.url, readerinfo_auth)
+    if not readerinfo_auth.get("acs_token"):
+        await race_readerinfo_seed(
+            context,
+            page,
+            source_url or page.url,
+            doc_id,
+            json_urls,
+            png_urls,
+            font_urls,
+            docinfo,
+            pending_response_tasks,
+            pending_request_tasks,
+            readerinfo_auth,
+        )
     await wait_for_pending_tasks(pending_response_tasks, pending_request_tasks)
     await fetch_missing_readerinfo_resources(
         context,
@@ -1293,8 +1356,11 @@ async def process_ppt(context, page, page_count, temp_dir, output_pdf, data, pro
 
     page.on("request", on_request)
     page.on("response", on_response)
-    await scroll_to_load(page, rounds=8)
-    await click_read_more(page, max_clicks=10)
+    await ensure_readerinfo_auth(page, page.url, readerinfo_auth)
+    await fetch_missing_readerinfo_page_images(context, doc_id, page_count, page.url, urls_by_page, readerinfo_auth)
+    if not page_count or len(urls_by_page) < page_count:
+        await scroll_to_load(page, rounds=8)
+        await click_read_more(page, max_clicks=10)
     await wait_for_pending_tasks(pending_response_tasks, pending_request_tasks)
     await fetch_missing_readerinfo_page_images(context, doc_id, page_count, page.url, urls_by_page, readerinfo_auth)
     for _ in range(10):

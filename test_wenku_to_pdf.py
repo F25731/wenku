@@ -22,6 +22,7 @@ from wenku_to_pdf import (
     parse_readerinfo_race_delays,
     merge_structured_html_urls,
     merge_page_image_urls_from_readerinfo,
+    normalize_acs_token,
     build_docinfo_page_maps,
     docinfo_document_info,
     page_from_docconvert_url,
@@ -32,6 +33,7 @@ from wenku_to_pdf import (
     structured_page_needs_image,
     structured_page_needs_font,
     structured_page_resource_needs,
+    readerinfo_extra_headers,
     url_with_query_params,
 )
 
@@ -320,6 +322,17 @@ class StructuredResourceTest(unittest.TestCase):
 
     def test_readerinfo_race_delays_ignore_bad_and_duplicate_values(self):
         self.assertEqual(parse_readerinfo_race_delays("0,5,bad,5,-1,10"), (0.0, 5.0, 10.0))
+
+    def test_normalizes_acs_token_shapes(self):
+        self.assertEqual(normalize_acs_token({"Acs-Token": " abc "}), "abc")
+        self.assertEqual(normalize_acs_token({"acs-token": "def"}), "def")
+        self.assertEqual(normalize_acs_token("ERR:missing"), "")
+
+    def test_readerinfo_headers_use_frontend_token_name(self):
+        headers = readerinfo_extra_headers({"acs_token": "token123"})
+
+        self.assertEqual(headers["Acs-Token"], "token123")
+        self.assertIn("application/json", headers["accept"])
 
     def test_readerinfo_font_urls_prefer_store_id(self):
         json_urls = {}
