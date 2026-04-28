@@ -38,23 +38,32 @@
                     <h1 class="text-3xl font-bold text-gray-900">Token 管理</h1>
                     <p class="mt-2 text-sm text-gray-500">创建授权、维护 Cookie、查看运行状态。</p>
                 </div>
-                <div class="flex gap-2">
-                    <a href="/" class="inline-flex items-center rounded-xl bg-white px-4 py-2 text-sm font-semibold text-indigo-700 shadow-sm hover:bg-indigo-50">
+                <div class="flex flex-wrap gap-2">
+                    <a href="/" class="inline-flex flex-1 items-center justify-center rounded-xl bg-white px-4 py-2 text-sm font-semibold text-indigo-700 shadow-sm hover:bg-indigo-50 sm:flex-none">
                         <i class="fas fa-home mr-2"></i>首页
                     </a>
-                    <button id="logoutBtn" class="inline-flex items-center rounded-xl bg-gray-900 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-gray-800">
+                    <button id="logoutBtn" class="inline-flex flex-1 items-center justify-center rounded-xl bg-gray-900 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-gray-800 sm:flex-none">
                         <i class="fas fa-lock mr-2"></i>锁定
                     </button>
                 </div>
             </div>
         </header>
 
-        <section class="grid gap-5 lg:grid-cols-[360px_1fr]">
+        <section class="grid gap-5 lg:grid-cols-[360px_minmax(0,1fr)]">
             <form id="createForm" class="glass-card rounded-2xl p-5">
                 <h2 class="mb-4 text-lg font-bold text-gray-900">新建 Token</h2>
-                <label class="mb-2 block text-sm font-semibold text-gray-700" for="days">有效天数</label>
-                <input id="days" type="number" min="1" max="3650" value="30"
-                    class="mb-4 w-full rounded-xl border border-gray-300 bg-white/90 px-4 py-3 outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500">
+                <div class="mb-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-1">
+                    <div>
+                        <label class="mb-2 block text-sm font-semibold text-gray-700" for="days">有效天数</label>
+                        <input id="days" type="number" min="1" max="3650" value="30"
+                            class="w-full rounded-xl border border-gray-300 bg-white/90 px-4 py-3 outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500">
+                    </div>
+                    <div>
+                        <label class="mb-2 block text-sm font-semibold text-gray-700" for="maxUses">使用次数</label>
+                        <input id="maxUses" type="number" min="1" max="100000" placeholder="留空为不限次数"
+                            class="w-full rounded-xl border border-gray-300 bg-white/90 px-4 py-3 outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500">
+                    </div>
+                </div>
                 <label class="mb-2 block text-sm font-semibold text-gray-700" for="remark">备注</label>
                 <input id="remark" type="text" maxlength="80" placeholder="例如：同学A / 课堂演示"
                     class="mb-5 w-full rounded-xl border border-gray-300 bg-white/90 px-4 py-3 outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500">
@@ -80,7 +89,7 @@
                         <h2 class="text-lg font-bold text-gray-900">授权列表</h2>
                         <p id="summaryText" class="mt-1 text-xs text-gray-500">正在读取...</p>
                     </div>
-                    <button id="refreshBtn" class="inline-flex items-center rounded-xl bg-white px-4 py-2 text-sm font-semibold text-indigo-700 shadow-sm hover:bg-indigo-50">
+                    <button id="refreshBtn" class="inline-flex shrink-0 items-center rounded-xl bg-white px-4 py-2 text-sm font-semibold text-indigo-700 shadow-sm hover:bg-indigo-50">
                         <i class="fas fa-rotate mr-2"></i>刷新
                     </button>
                 </div>
@@ -99,7 +108,7 @@
                 </button>
             </div>
 
-            <form id="cookieCreateForm" class="mb-5 grid gap-3 lg:grid-cols-[220px_1fr_auto]">
+            <form id="cookieCreateForm" class="mb-5 grid gap-3 lg:grid-cols-[220px_minmax(0,1fr)_auto]">
                 <input id="cookieName" type="text" maxlength="40" placeholder="自定义名字"
                     class="rounded-xl border border-gray-300 bg-white/90 px-4 py-3 text-sm outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500">
                 <input id="cookieValue" type="text" placeholder="粘贴 Cookie"
@@ -195,6 +204,7 @@
         function statusLabel(token) {
             if (!token.enabled) return ['已停用', 'bg-gray-100 text-gray-600'];
             if (token.expired) return ['已过期', 'bg-red-50 text-red-600'];
+            if (token.uses_exhausted) return ['次数用完', 'bg-red-50 text-red-600'];
             return ['可使用', 'bg-green-50 text-green-700'];
         }
 
@@ -213,6 +223,15 @@
             return badges.join('');
         }
 
+        function usageLabel(token) {
+            const success = Number(token.success_count ?? token.usage_count ?? 0);
+            const reserved = Number(token.reserved_count || 0);
+            if (token.max_uses === null || token.max_uses === undefined) {
+                return reserved ? `${success}/不限，占用 ${reserved}` : `${success}/不限`;
+            }
+            return reserved ? `${success}/${token.max_uses}，占用 ${reserved}` : `${success}/${token.max_uses}`;
+        }
+
         function renderTokens(tokens) {
             summaryText.textContent = `共 ${tokens.length} 个 Token`;
             if (!tokens.length) {
@@ -225,7 +244,7 @@
                 return `
                     <article class="rounded-xl border border-gray-200 bg-white/80 p-4 shadow-sm">
                         <div class="mb-3 flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
-                            <div class="min-w-0">
+                            <div class="min-w-0 flex-1">
                                 <div class="flex flex-wrap items-center gap-2">
                                     <span class="rounded-full px-3 py-1 text-xs font-semibold ${tone}">${label}</span>
                                     ${tokenScopeBadges(token)}
@@ -233,7 +252,7 @@
                                 </div>
                                 <div class="mt-2 break-all rounded-lg bg-gray-950 px-3 py-2 font-mono text-xs text-indigo-50">${escapeHtml(token.token)}</div>
                             </div>
-                            <div class="flex shrink-0 flex-wrap gap-2">
+                            <div class="grid shrink-0 grid-cols-2 gap-2 sm:flex sm:flex-wrap">
                                 <button data-copy="${escapeHtml(link)}" class="copyBtn rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white hover:bg-indigo-700">
                                     <i class="fas fa-copy mr-1"></i>链接
                                 </button>
@@ -248,9 +267,9 @@
                                 </button>
                             </div>
                         </div>
-                        <div class="grid gap-2 text-xs text-gray-500 sm:grid-cols-4">
+                        <div class="grid gap-2 text-xs text-gray-500 sm:grid-cols-2 xl:grid-cols-4">
                             <span>到期：${escapeHtml(token.expires_at_text)}</span>
-                            <span>次数：${token.usage_count}</span>
+                            <span>次数：${escapeHtml(usageLabel(token))}</span>
                             <span>最近：${escapeHtml(token.last_used_at_text || '--')}</span>
                             <span>来源：${escapeHtml(token.last_ip || '--')}</span>
                         </div>
@@ -337,12 +356,19 @@
             createMessage.classList.add('hidden');
             try {
                 const days = document.getElementById('days').value;
+                const maxUses = document.getElementById('maxUses').value.trim();
                 const remark = document.getElementById('remark').value;
                 const allowWeb = document.getElementById('allowWeb').checked;
                 const allowApi = document.getElementById('allowApi').checked;
                 const data = await adminFetch('/api/admin/tokens', {
                     method: 'POST',
-                    body: JSON.stringify({ days, remark, allow_web: allowWeb, allow_api: allowApi })
+                    body: JSON.stringify({
+                        days,
+                        remark,
+                        max_uses: maxUses || null,
+                        allow_web: allowWeb,
+                        allow_api: allowApi
+                    })
                 });
                 showMessage(createMessage, `已生成：${data.token.token}`, true);
                 await loadTokens();

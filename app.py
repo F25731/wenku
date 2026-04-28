@@ -441,6 +441,12 @@ def init_token_db():
                 connection.execute("ALTER TABLE tokens ADD COLUMN allow_web INTEGER NOT NULL DEFAULT 1")
             if "allow_api" not in columns:
                 connection.execute("ALTER TABLE tokens ADD COLUMN allow_api INTEGER NOT NULL DEFAULT 1")
+            if "max_uses" not in columns:
+                connection.execute("ALTER TABLE tokens ADD COLUMN max_uses INTEGER")
+            if "success_count" not in columns:
+                connection.execute("ALTER TABLE tokens ADD COLUMN success_count INTEGER NOT NULL DEFAULT 0")
+            if "reserved_count" not in columns:
+                connection.execute("ALTER TABLE tokens ADD COLUMN reserved_count INTEGER NOT NULL DEFAULT 0")
             connection.commit()
 
 
@@ -448,6 +454,10 @@ def token_row_to_dict(row):
     now = time.time()
     expires_at = float(row["expires_at"])
     last_used_at = row["last_used_at"]
+    max_uses = row["max_uses"]
+    success_count = int(row["success_count"])
+    reserved_count = int(row["reserved_count"])
+    remaining_uses = None if max_uses is None else max(0, int(max_uses) - success_count - reserved_count)
     return {
         "id": row["id"],
         "token": row["token"],
@@ -461,6 +471,11 @@ def token_row_to_dict(row):
         "allow_api": bool(row["allow_api"]),
         "expired": expires_at <= now,
         "usage_count": row["usage_count"],
+        "max_uses": max_uses,
+        "success_count": success_count,
+        "reserved_count": reserved_count,
+        "remaining_uses": remaining_uses,
+        "uses_exhausted": remaining_uses == 0 if max_uses is not None else False,
         "last_used_at": last_used_at,
         "last_used_at_text": format_time(last_used_at),
         "last_ip": row["last_ip"] or "",
@@ -474,13 +489,26 @@ def list_access_tokens():
     return [token_row_to_dict(row) for row in rows]
 
 
-def create_access_token(days, remark="", token_value=None, allow_web=True, allow_api=True):
+def normalize_max_uses(max_uses):
+    if max_uses in (None, ""):
+        return None
+    try:
+        value = int(max_uses)
+    except (TypeError, ValueError):
+        raise ValueError("次数必须是整数")
+    if value < 1 or value > 100000:
+        raise ValueError("次数需要在 1 到 100000 之间")
+    return value
+
+
+def create_access_token(days, remark="", token_value=None, allow_web=True, allow_api=True, max_uses=None):
     try:
         days = int(days)
     except (TypeError, ValueError):
         raise ValueError("天数必须是整数")
     if days < 1 or days > 3650:
         raise ValueError("天数需要在 1 到 3650 之间")
+    max_uses = normalize_max_uses(max_uses)
 
     init_token_db()
     now = time.time()
@@ -495,10 +523,10 @@ def create_access_token(days, remark="", token_value=None, allow_web=True, allow
         with connect_token_db() as connection:
             connection.execute(
                 """
-                INSERT INTO tokens (token, remark, created_at, expires_at, enabled, allow_web, allow_api)
-                VALUES (?, ?, ?, ?, 1, ?, ?)
+                INSERT INTO tokens (token, remark, created_at, expires_at, enabled, allow_web, allow_api, max_uses)
+                VALUES (?, ?, ?, ?, 1, ?, ?, ?)
                 """,
-                (token, remark, now, now + days * 86400, 1 if allow_web else 0, 1 if allow_api else 0),
+                (token, remark, now, now + days * 86400, 1 if allow_web else 0, 1 if allow_api else 0, max_uses),
             )
             connection.commit()
             row = connection.execute("SELECT * FROM tokens WHERE token = ?", (token,)).fetchone()
@@ -530,7 +558,7 @@ def verify_access_token(token, touch=False, ip_address="", scope="web"):
                 connection.execute(
                     """
                     UPDATE tokens
-                    SET usage_count = usage_count + 1, last_used_at = ?, last_ip = ?
+                    SET last_used_at = ?, last_ip = ?
                     WHERE token = ?
                     """,
                     (now, (ip_address or "")[:64], token),
@@ -539,6 +567,103 @@ def verify_access_token(token, touch=False, ip_address="", scope="web"):
                 row = connection.execute("SELECT * FROM tokens WHERE token = ?", (token,)).fetchone()
                 data = token_row_to_dict(row)
     return True, "Token 可用", data
+
+
+def consume_access_token_success(token, ip_address=""):
+    token = (token or "").strip()
+    if not token:
+        return None
+    init_token_db()
+    now = time.time()
+    with token_db_lock:
+        with connect_token_db() as connection:
+            row = connection.execute("SELECT * FROM tokens WHERE token = ?", (token,)).fetchone()
+            if not row:
+                return None
+            data = token_row_to_dict(row)
+            if data["uses_exhausted"] and data["reserved_count"] <= 0:
+                return data
+            reserved_delta = -1 if data["reserved_count"] > 0 else 0
+            connection.execute(
+                """
+                UPDATE tokens
+                SET usage_count = usage_count + 1,
+                    success_count = success_count + 1,
+                    reserved_count = MAX(0, reserved_count + ?),
+                    last_used_at = ?,
+                    last_ip = ?
+                WHERE token = ?
+                """,
+                (reserved_delta, now, (ip_address or "")[:64], token),
+            )
+            connection.commit()
+            row = connection.execute("SELECT * FROM tokens WHERE token = ?", (token,)).fetchone()
+    return token_row_to_dict(row) if row else None
+
+
+def reserve_access_token_use(token, ip_address="", scope="web"):
+    token = (token or "").strip()
+    if not token:
+        return False, "请先输入使用 Token", None
+    init_token_db()
+    now = time.time()
+    with token_db_lock:
+        with connect_token_db() as connection:
+            row = connection.execute("SELECT * FROM tokens WHERE token = ?", (token,)).fetchone()
+            if not row:
+                return False, "Token 不存在或已失效", None
+            data = token_row_to_dict(row)
+            if not data["enabled"]:
+                return False, "Token 已停用", data
+            if data["expired"]:
+                return False, "Token 已过期", data
+            if scope == "web" and not data["allow_web"]:
+                return False, "Token 不允许网站使用", data
+            if scope == "api" and not data["allow_api"]:
+                return False, "Token 不允许接口调用", data
+            if data["uses_exhausted"]:
+                return False, "Token 次数已用完", data
+
+            if data["max_uses"] is None:
+                connection.execute(
+                    "UPDATE tokens SET last_used_at = ?, last_ip = ? WHERE token = ?",
+                    (now, (ip_address or "")[:64], token),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE tokens
+                    SET reserved_count = reserved_count + 1,
+                        last_used_at = ?,
+                        last_ip = ?
+                    WHERE token = ?
+                    """,
+                    (now, (ip_address or "")[:64], token),
+                )
+            connection.commit()
+            row = connection.execute("SELECT * FROM tokens WHERE token = ?", (token,)).fetchone()
+    return True, "Token 可用", token_row_to_dict(row)
+
+
+def release_access_token_use(token):
+    token = (token or "").strip()
+    if not token:
+        return None
+    init_token_db()
+    with token_db_lock:
+        with connect_token_db() as connection:
+            row = connection.execute("SELECT * FROM tokens WHERE token = ?", (token,)).fetchone()
+            if not row:
+                return None
+            data = token_row_to_dict(row)
+            if data["reserved_count"] > 0:
+                connection.execute(
+                    "UPDATE tokens SET reserved_count = reserved_count - 1 WHERE token = ?",
+                    (token,),
+                )
+                connection.commit()
+                row = connection.execute("SELECT * FROM tokens WHERE token = ?", (token,)).fetchone()
+    return token_row_to_dict(row) if row else None
 
 
 def set_access_token_enabled(token_id, enabled):
@@ -891,7 +1016,16 @@ class WorkerBrowserRuntime:
         return self.loop.run_until_complete(self.convert(**kwargs))
 
 
-def run_convert_job(job_id, url, cookie, cookie_slot=None, cookie_total=None, browser_runtime=None):
+def run_convert_job(
+    job_id,
+    url,
+    cookie,
+    cookie_slot=None,
+    cookie_total=None,
+    browser_runtime=None,
+    access_token="",
+    access_ip="",
+):
     started_at = time.perf_counter()
     ensure_job_not_cancelled(job_id)
     update_job(job_id, status="running")
@@ -930,15 +1064,19 @@ def run_convert_job(job_id, url, cookie, cookie_slot=None, cookie_total=None, br
         }
         add_job_log(job_id, payload["message"], "ok")
         add_job_log(job_id, f"文件已保存：{filename}", "ok")
+        consume_access_token_success(access_token, ip_address=access_ip)
         update_job(job_id, status="done", result=payload, finished_at=time.time())
     except JobCancelled:
+        release_access_token_use(access_token)
         add_job_log(job_id, "任务已取消", "error")
         update_job(job_id, status="cancelled", error="任务已取消", finished_at=time.time())
     except Exception as exc:
         if job_is_cancel_requested(job_id):
+            release_access_token_use(access_token)
             add_job_log(job_id, "任务已取消", "error")
             update_job(job_id, status="cancelled", error="任务已取消", finished_at=time.time())
         else:
+            release_access_token_use(access_token)
             add_job_log(job_id, f"转换失败：{exc}", "error")
             update_job(job_id, status="error", error=str(exc), finished_at=time.time())
     finally:
@@ -954,7 +1092,13 @@ def queued_convert_worker(worker_id):
         JOB_RETRY_COUNT,
     )
     while True:
-        job_id, url, override_cookie = job_queue.get()
+        queue_item = job_queue.get()
+        if len(queue_item) == 3:
+            job_id, url, override_cookie = queue_item
+            access_token = ""
+            access_ip = ""
+        else:
+            job_id, url, override_cookie, access_token, access_ip = queue_item
         has_waiting_marker = False
         slot_acquired = False
         try:
@@ -983,14 +1127,25 @@ def queued_convert_worker(worker_id):
                     raise RuntimeError("没有找到 Cookie，请先把 Cookie 写入 cookie.txt")
 
                 add_job_log(job_id, f"进入处理通道 {active_count}/{limit}", "ok")
-                run_convert_job(job_id, url, cookie, cookie_slot, cookie_total, browser_runtime=browser_runtime)
+                run_convert_job(
+                    job_id,
+                    url,
+                    cookie,
+                    cookie_slot,
+                    cookie_total,
+                    browser_runtime=browser_runtime,
+                    access_token=access_token,
+                    access_ip=access_ip,
+                )
             finally:
                 if slot_acquired:
                     release_job_slot()
         except JobCancelled:
+            release_access_token_use(access_token)
             add_job_log(job_id, "任务已取消", "error")
             update_job(job_id, status="cancelled", error="任务已取消", finished_at=time.time())
         except Exception as exc:
+            release_access_token_use(access_token)
             add_job_log(job_id, f"转换失败：{exc}", "error")
             update_job(job_id, status="error", error=str(exc), finished_at=time.time())
         finally:
@@ -1176,14 +1331,16 @@ def api_convert():
     if not url:
         return jsonify({"error": "请先填写百度文库链接"}), 400
 
-    token_ok, token_message, _ = verify_access_token(access_token, scope=access_scope)
-    if not token_ok:
-        return jsonify({"error": token_message}), 403
-
     if not override_cookie and not read_cookie_pool():
         return jsonify({"error": "没有找到 Cookie，请先把 Cookie 写入 cookie.txt"}), 400
 
-    verify_access_token(access_token, touch=True, ip_address=request.remote_addr or "", scope=access_scope)
+    token_ok, token_message, _ = reserve_access_token_use(
+        access_token,
+        ip_address=request.remote_addr or "",
+        scope=access_scope,
+    )
+    if not token_ok:
+        return jsonify({"error": token_message}), 403
 
     job_id = uuid.uuid4().hex
     with jobs_lock:
@@ -1200,7 +1357,7 @@ def api_convert():
 
     add_job_log(job_id, f"收到链接：{url}", "ok")
     add_job_log(job_id, f"任务已排队，当前通道上限 {job_concurrency_limit()} 个", "ok")
-    job_queue.put((job_id, url, override_cookie))
+    job_queue.put((job_id, url, override_cookie, access_token, request.remote_addr or ""))
     return jsonify({"success": True, "job_id": job_id}), 202
 
 
@@ -1248,6 +1405,7 @@ def api_admin_tokens():
             data.get("remark", ""),
             allow_web=bool(data.get("allow_web", True)),
             allow_api=bool(data.get("allow_api", True)),
+            max_uses=data.get("max_uses"),
         )
     except sqlite3.IntegrityError:
         return jsonify({"error": "Token 已存在，请重新生成"}), 400

@@ -298,6 +298,62 @@ class TokenBackendTest(unittest.TestCase):
         self.assertFalse(web_token_ok)
         self.assertEqual(web_message, "Token 不允许网站使用")
 
+    def test_limited_access_token_tracks_successful_uses_only(self):
+        token = app.create_access_token(7, "limited", max_uses=2)
+
+        ok, _, token_data = app.verify_access_token(token["token"])
+        self.assertTrue(ok)
+        self.assertEqual(token_data["max_uses"], 2)
+        self.assertEqual(token_data["success_count"], 0)
+        self.assertEqual(token_data["remaining_uses"], 2)
+
+        app.consume_access_token_success(token["token"], ip_address="127.0.0.1")
+        ok, _, token_data = app.verify_access_token(token["token"])
+        self.assertTrue(ok)
+        self.assertEqual(token_data["success_count"], 1)
+        self.assertEqual(token_data["usage_count"], 1)
+        self.assertEqual(token_data["remaining_uses"], 1)
+
+        app.consume_access_token_success(token["token"], ip_address="127.0.0.1")
+        ok, message, token_data = app.verify_access_token(token["token"])
+        self.assertTrue(ok)
+        self.assertEqual(message, "Token 可用")
+        self.assertEqual(token_data["success_count"], 2)
+        self.assertEqual(token_data["remaining_uses"], 0)
+
+        reserve_ok, reserve_message, _ = app.reserve_access_token_use(token["token"], ip_address="127.0.0.1")
+        self.assertFalse(reserve_ok)
+        self.assertEqual(reserve_message, "Token 次数已用完")
+
+    def test_verify_touch_does_not_consume_limited_token(self):
+        token = app.create_access_token(7, "limited", max_uses=1)
+
+        ok, _, token_data = app.verify_access_token(token["token"], touch=True, ip_address="127.0.0.1")
+
+        self.assertTrue(ok)
+        self.assertEqual(token_data["success_count"], 0)
+        self.assertEqual(token_data["usage_count"], 0)
+        self.assertEqual(token_data["remaining_uses"], 1)
+
+    def test_limited_token_reservation_prevents_over_queueing_and_can_release(self):
+        token = app.create_access_token(7, "limited", max_uses=1)
+
+        first_ok, _, first_data = app.reserve_access_token_use(token["token"], ip_address="127.0.0.1")
+        second_ok, second_message, second_data = app.reserve_access_token_use(token["token"], ip_address="127.0.0.1")
+
+        self.assertTrue(first_ok)
+        self.assertEqual(first_data["reserved_count"], 1)
+        self.assertEqual(first_data["remaining_uses"], 0)
+        self.assertFalse(second_ok)
+        self.assertEqual(second_message, "Token 次数已用完")
+        self.assertEqual(second_data["remaining_uses"], 0)
+
+        app.release_access_token_use(token["token"])
+        ok, _, released_data = app.verify_access_token(token["token"])
+        self.assertTrue(ok)
+        self.assertEqual(released_data["reserved_count"], 0)
+        self.assertEqual(released_data["remaining_uses"], 1)
+
     def test_expired_access_token_is_rejected(self):
         token = app.create_access_token(1, "expired")
         with app.connect_token_db() as connection:
@@ -423,6 +479,21 @@ class TokenBackendTest(unittest.TestCase):
         self.assertFalse(payload["allow_web"])
         self.assertTrue(payload["allow_api"])
 
+    def test_admin_api_creates_limited_access_token(self):
+        client = app.app.test_client()
+
+        response = client.post(
+            "/api/admin/tokens",
+            json={"days": 3, "remark": "times", "max_uses": 5},
+            headers={"X-Admin-Token": "admin-secret"},
+        )
+
+        self.assertEqual(response.status_code, 201)
+        payload = response.get_json()["token"]
+        self.assertEqual(payload["max_uses"], 5)
+        self.assertEqual(payload["success_count"], 0)
+        self.assertEqual(payload["remaining_uses"], 5)
+
     def test_scoped_download_permission(self):
         Path(app.DOWNLOAD_DIR, "scoped.pdf").write_bytes(b"pdf")
         token = app.create_access_token(1, "api", allow_web=False, allow_api=True)
@@ -434,6 +505,16 @@ class TokenBackendTest(unittest.TestCase):
         self.assertEqual(web_denied.status_code, 403)
         self.assertEqual(api_allowed.status_code, 200)
         api_allowed.close()
+
+    def test_exhausted_token_can_still_download_existing_file(self):
+        Path(app.DOWNLOAD_DIR, "done.pdf").write_bytes(b"pdf")
+        token = app.create_access_token(1, "download", max_uses=1)
+        app.consume_access_token_success(token["token"], ip_address="127.0.0.1")
+
+        response = app.app.test_client().get(f"/download/done.pdf?token={token['token']}")
+
+        self.assertEqual(response.status_code, 200)
+        response.close()
 
     def test_admin_cookie_api_reads_and_saves_pool(self):
         client = app.app.test_client()
