@@ -19,9 +19,11 @@ from wenku_to_pdf import (
     is_mostly_blank_image,
     json_callback_body,
     build_readerinfo_url,
+    build_public_readerinfo_url,
     parse_readerinfo_race_delays,
     merge_structured_html_urls,
     merge_page_image_urls_from_readerinfo,
+    normalized_html_urls,
     normalize_acs_token,
     build_docinfo_page_maps,
     docinfo_document_info,
@@ -302,6 +304,38 @@ class StructuredResourceTest(unittest.TestCase):
         self.assertEqual(png_urls[3], "https://example.test/2.png")
         self.assertIn("pn=3", font_urls[3])
 
+    def test_merges_public_readerinfo_string_html_urls(self):
+        json_urls = {}
+        png_urls = {}
+        font_urls = {}
+        merge_structured_html_urls(
+            {
+                "status": {"code": 0, "msg": "success"},
+                "data": {
+                    "oriReaderInfo": {
+                        "storeId": "store456",
+                        "htmlUrls": (
+                            '{"json":[{"pageIndex":1,"pageLoadUrl":"https://example.test/1.json"}],'
+                            '"png":[{"pageIndex":1,"pageLoadUrl":"https://example.test/1.png"}],'
+                            '"ttf":[{"pageIndex":1,"param":"&md5sum=abc&range=1-2"}]}'
+                        ),
+                    }
+                },
+            },
+            "doc123",
+            json_urls,
+            png_urls,
+            font_urls,
+        )
+
+        self.assertEqual(json_urls[1], "https://example.test/1.json")
+        self.assertEqual(png_urls[1], "https://example.test/1.png")
+        self.assertIn("/store456?", font_urls[1])
+
+    def test_normalizes_html_urls_from_json_string(self):
+        self.assertEqual(normalized_html_urls('{"json": []}'), {"json": []})
+        self.assertIsNone(normalized_html_urls("{bad"))
+
     def test_readerinfo_url_requests_large_page_window(self):
         url = build_readerinfo_url(
             "doc123",
@@ -310,6 +344,23 @@ class StructuredResourceTest(unittest.TestCase):
             "https://wenku.baidu.com/view/doc123.html?wkQuery=math&chatType=chat",
         )
 
+        self.assertIn("docId=doc123", url)
+        self.assertIn("pn=3", url)
+        self.assertIn("rn=200", url)
+        self.assertIn("powerId=2", url)
+        self.assertIn("bizName=mainPc", url)
+        self.assertIn("wkQuery=math", url)
+
+    def test_public_readerinfo_url_uses_getdocreader2019(self):
+        url = build_public_readerinfo_url(
+            "doc123",
+            3,
+            200,
+            "https://wenku.baidu.com/view/doc123.html?wkQuery=math&chatType=chat",
+        )
+
+        self.assertIn("/browse/interface/getdocreader2019?", url)
+        self.assertIn("doc_id=doc123", url)
         self.assertIn("docId=doc123", url)
         self.assertIn("pn=3", url)
         self.assertIn("rn=200", url)
