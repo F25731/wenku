@@ -64,6 +64,7 @@ class ImageBlankDetectionTest(unittest.TestCase):
 
             self.assertFalse(is_mostly_blank_image(path))
 
+
     def test_sparse_landscape_formula_page_is_not_blank(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "formula.png"
@@ -84,6 +85,38 @@ class ImageBlankDetectionTest(unittest.TestCase):
             path = Path(temp_dir) / "missing.png"
 
             self.assertFalse(page_image_ready(path, require_nonblank_pages=True))
+
+
+class ConvertHttpFirstTest(unittest.IsolatedAsyncioTestCase):
+    async def test_convert_returns_http_result_without_starting_playwright(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "out"
+
+            async def fake_http_convert(url, cookie_text, temp_dir, output_dir, progress=None):
+                output_pdf = Path(output_dir) / "demo.pdf"
+                output_pdf.write_bytes(b"%PDF-1.4\n% demo\n")
+                return {"output": str(output_pdf), "mode": "http-direct", "pages": 1}
+
+            def fail_if_playwright_starts():
+                raise AssertionError("Playwright should not start after HTTP conversion succeeds")
+
+            original_http_convert = wenku_to_pdf.try_convert_http_only
+            original_playwright = wenku_to_pdf.async_playwright
+            try:
+                wenku_to_pdf.try_convert_http_only = fake_http_convert
+                wenku_to_pdf.async_playwright = fail_if_playwright_starts
+
+                result = await wenku_to_pdf.convert(
+                    "https://wenku.baidu.com/view/demo.html",
+                    "BDUSS=demo",
+                    output_dir,
+                )
+
+                self.assertEqual(result["mode"], "http-direct")
+                self.assertEqual(result["pages"], 1)
+            finally:
+                wenku_to_pdf.try_convert_http_only = original_http_convert
+                wenku_to_pdf.async_playwright = original_playwright
 
 
 class ReaderOverlayHideCssTest(unittest.TestCase):

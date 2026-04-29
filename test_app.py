@@ -102,6 +102,27 @@ class WorkerBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(app.WorkerBrowserRuntime.document_ready_message("页面资源准备完成，共 10 页"))
         self.assertTrue(app.WorkerBrowserRuntime.document_ready_message("处理第 1/10 页 ✅"))
 
+    async def test_convert_uses_http_success_without_starting_browser(self):
+        old_convert_http_only = app.convert_http_only
+
+        async def fast_http_convert(**kwargs):
+            return {"output": "http.pdf", "pages": 1, "mode": "http-direct"}
+
+        class HttpOnlyRuntime(app.WorkerBrowserRuntime):
+            async def ensure_browser(self):
+                raise AssertionError("Browser should not start after HTTP conversion succeeds")
+
+        app.convert_http_only = fast_http_convert
+        runtime = HttpOnlyRuntime(worker_id=1, restart_after_jobs=20)
+        try:
+            result = await runtime.convert(url="u", cookie_text="c", output_dir="out")
+
+            self.assertEqual(result["output"], "http.pdf")
+            self.assertEqual(result["mode"], "http-direct")
+        finally:
+            app.convert_http_only = old_convert_http_only
+            runtime.loop.close()
+
     async def test_convert_error_restarts_browser_and_retries_once(self):
         old_convert_with_browser = app.convert_with_browser
         calls = {"count": 0}

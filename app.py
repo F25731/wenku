@@ -17,7 +17,7 @@ from flask import Flask, jsonify, render_template, request, send_from_directory
 
 from playwright.async_api import async_playwright
 
-from wenku_to_pdf import browser_context_options, browser_process_launch_options, convert, convert_with_browser
+from wenku_to_pdf import browser_context_options, browser_process_launch_options, convert, convert_http_only, convert_with_browser
 
 
 app = Flask(__name__)
@@ -935,6 +935,21 @@ class WorkerBrowserRuntime:
         attempts = self.retry_count + 1
         original_progress = kwargs.get("progress")
         first_started_at = time.monotonic()
+        http_kwargs = {
+            "url": kwargs.get("url"),
+            "cookie_text": kwargs.get("cookie_text", ""),
+            "output_dir": kwargs.get("output_dir"),
+            "temp_root": kwargs.get("temp_root"),
+            "keep_temp": kwargs.get("keep_temp", False),
+            "progress": original_progress,
+            "emit_cleanup_on_failure": False,
+        }
+        try:
+            return await convert_http_only(**http_kwargs)
+        except Exception:
+            if original_progress:
+                original_progress("正在切换备用处理方案")
+
         for attempt in range(1, attempts + 1):
             browser = await self.ensure_browser()
             document_ready = asyncio.Event()

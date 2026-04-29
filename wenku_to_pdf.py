@@ -11,6 +11,8 @@ import tempfile
 import time
 from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
+import urllib.error
+import urllib.request
 
 import img2pdf
 from PIL import Image, ImageDraw
@@ -38,8 +40,14 @@ READERINFO_PAGE_WINDOW = int(os.environ.get("WENKU_READERINFO_PAGE_WINDOW", "200
 READERINFO_RACE_DELAY_TEXT = os.environ.get("WENKU_READERINFO_RACE_DELAYS", "0,5,10")
 READERINFO_RACE_TIMEOUT_SECONDS = float(os.environ.get("WENKU_READERINFO_RACE_TIMEOUT_SECONDS", "40"))
 READERINFO_TOKEN_TIMEOUT_SECONDS = float(os.environ.get("WENKU_READERINFO_TOKEN_TIMEOUT_SECONDS", "15"))
+HTTP_ONLY_ATTEMPTS = int(os.environ.get("WENKU_HTTP_ONLY_ATTEMPTS", "2"))
 DIRECT_STRUCTURED_TYPES = {"word", "doc", "docx", "pdf"}
 DIRECT_STRUCTURED_FALLBACK_TYPES = {"", "0", "txt", "html"}
+HTTP_USER_AGENT = os.environ.get(
+    "WENKU_HTTP_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+)
 DOCINFO_TYPE_MAP = {
     "1": "word",
     "2": "excel",
@@ -128,6 +136,55 @@ def parse_cookie_header(cookie_header):
             }
         )
     return cookies
+
+
+class HttpResponseAdapter:
+    def __init__(self, url, status, headers, body):
+        self.url = url
+        self.status = status
+        self.headers = headers
+        self._body = body
+
+    async def body(self):
+        return self._body
+
+
+class HttpRequestAdapter:
+    def __init__(self, cookie_text):
+        self.cookie_text = (cookie_text or "").strip()
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    async def get(self, url, headers=None, timeout=RESOURCE_REQUEST_TIMEOUT_MS):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._get_sync, url, headers or {}, timeout)
+
+    def _get_sync(self, url, headers, timeout_ms):
+        request_headers = {
+            "User-Agent": HTTP_USER_AGENT,
+            "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Connection": "keep-alive",
+        }
+        if self.cookie_text:
+            request_headers["Cookie"] = self.cookie_text
+        request_headers.update({key: value for key, value in (headers or {}).items() if value})
+        request = urllib.request.Request(url, headers=request_headers)
+        timeout_seconds = max(float(timeout_ms or RESOURCE_REQUEST_TIMEOUT_MS) / 1000, 1)
+        try:
+            with self.opener.open(request, timeout=timeout_seconds) as response:
+                return HttpResponseAdapter(
+                    response.geturl(),
+                    getattr(response, "status", response.getcode()),
+                    response.headers,
+                    response.read(),
+                )
+        except urllib.error.HTTPError as exc:
+            return HttpResponseAdapter(exc.geturl(), exc.code, exc.headers, exc.read())
+
+
+class HttpContextAdapter:
+    def __init__(self, cookie_text):
+        self.request = HttpRequestAdapter(cookie_text)
 
 
 def sanitize_filename(name):
@@ -1296,6 +1353,7 @@ async def process_structured_document(
     source_url=None,
     docinfo=None,
     direct=False,
+    allow_page_fallback=True,
 ):
     doc_id = doc_id_from_data_or_url(data, source_url or page.url)
     if not doc_id:
@@ -1311,6 +1369,8 @@ async def process_structured_document(
     async def load_reader_page_if_needed():
         nonlocal data, file_type, page_count, doc_id, page_loaded
         nonlocal pending_response_tasks, pending_request_tasks, readerinfo_auth
+        if page is None or not allow_page_fallback:
+            raise StructuredResourceNotUsable("HTTP 资源不完整，需要浏览器兜底")
         if page_loaded:
             return
         pending_response_tasks, pending_request_tasks, readerinfo_auth = bind_structured_resource_collector(
@@ -2024,6 +2084,105 @@ async def try_direct_structured_document(browser_context, page, temp_dir, output
         return None
 
 
+async def try_convert_http_only(url, cookie_text, temp_dir, output_dir, progress=None):
+    context = HttpContextAdapter(cookie_text)
+    doc_id = doc_id_from_data_or_url({}, url)
+    if not doc_id:
+        raise StructuredResourceNotUsable("无法识别文档 ID")
+
+    emit_progress(progress, "正在进入文档空间")
+    emit_progress(progress, "正在读取文档信息")
+    docinfo = await fetch_docinfo(context, doc_id, url)
+    title, file_type, page_count = docinfo_document_info(docinfo)
+    document = {
+        "data": None,
+        "docinfo": docinfo,
+        "title": title,
+        "file_type": file_type,
+        "tpl_key": "",
+        "page_count": page_count,
+    }
+    if not can_try_direct_structured_document(document):
+        raise StructuredResourceNotUsable("当前文档类型需要备用处理方案")
+
+    output_pdf = output_dir / f"{title}.pdf"
+    emit_progress(progress, f"文档名称：{title}")
+    emit_progress(progress, f"文档页数：{page_count or 'unknown'}")
+    emit_progress(progress, "已选择最佳处理方案")
+    result = await process_structured_document(
+        context,
+        None,
+        page_count,
+        temp_dir,
+        output_pdf,
+        {},
+        file_type,
+        progress=progress,
+        source_url=url,
+        docinfo=docinfo,
+        direct=True,
+        allow_page_fallback=False,
+    )
+    emit_progress(progress, f"最终文件已生成：{output_pdf.name}")
+    return {"output": str(output_pdf), **result}
+
+
+async def convert_http_only(
+    url,
+    cookie_text,
+    output_dir,
+    temp_root=None,
+    keep_temp=False,
+    progress=None,
+    emit_cleanup_on_failure=True,
+):
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    temp_parent = Path(temp_root).resolve() if temp_root else None
+    return await run_http_only_attempts(
+        url,
+        cookie_text,
+        output_dir,
+        temp_parent=temp_parent,
+        keep_temp=keep_temp,
+        progress=progress,
+        emit_cleanup_on_failure=emit_cleanup_on_failure,
+    )
+
+
+async def run_http_only_attempts(
+    url,
+    cookie_text,
+    output_dir,
+    temp_parent=None,
+    keep_temp=False,
+    progress=None,
+    emit_cleanup_on_failure=True,
+):
+    last_error = None
+    attempts = max(1, HTTP_ONLY_ATTEMPTS)
+    for attempt in range(1, attempts + 1):
+        temp_dir = Path(tempfile.mkdtemp(prefix="wenku_to_pdf_", dir=str(temp_parent) if temp_parent else None))
+        success = False
+        try:
+            result = await try_convert_http_only(url, cookie_text, temp_dir, output_dir, progress=progress)
+            success = True
+            return result
+        except Exception as exc:
+            last_error = exc
+            if attempt < attempts:
+                emit_progress(progress, "正在重新准备文档资源")
+        finally:
+            if keep_temp:
+                emit_progress(progress, f"保留诊断目录：{temp_dir}")
+            else:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                if success or (attempt == attempts and emit_cleanup_on_failure):
+                    emit_progress(progress, "运行环境已整理完成")
+    raise last_error
+
+
 async def fallback_html_screenshots(
     page,
     url,
@@ -2172,10 +2331,24 @@ async def convert(url, cookie_text, output_dir, temp_root=None, keep_temp=False,
     output_dir.mkdir(parents=True, exist_ok=True)
 
     temp_parent = Path(temp_root).resolve() if temp_root else None
-    temp_dir = Path(tempfile.mkdtemp(prefix="wenku_to_pdf_", dir=str(temp_parent) if temp_parent else None))
-    profile_dir = Path(tempfile.mkdtemp(prefix="wenku_chrome_profile_", dir=str(temp_parent) if temp_parent else None))
+    profile_dir = None
 
     try:
+        try:
+            return await run_http_only_attempts(
+                url,
+                cookie_text,
+                output_dir,
+                temp_parent=temp_parent,
+                keep_temp=keep_temp,
+                progress=progress,
+                emit_cleanup_on_failure=False,
+            )
+        except Exception:
+            emit_progress(progress, "正在切换备用处理方案")
+
+        temp_dir = Path(tempfile.mkdtemp(prefix="wenku_to_pdf_", dir=str(temp_parent) if temp_parent else None))
+        profile_dir = Path(tempfile.mkdtemp(prefix="wenku_chrome_profile_", dir=str(temp_parent) if temp_parent else None))
         async with async_playwright() as p:
             browser_context = await p.chromium.launch_persistent_context(**browser_launch_options(profile_dir, scale))
             try:
@@ -2183,13 +2356,14 @@ async def convert(url, cookie_text, output_dir, temp_root=None, keep_temp=False,
             finally:
                 await browser_context.close()
     finally:
-        if keep_temp:
-            emit_progress(progress, f"保留诊断目录：{temp_dir}")
-            emit_progress(progress, f"保留运行目录：{profile_dir}")
-        else:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            shutil.rmtree(profile_dir, ignore_errors=True)
-            emit_progress(progress, "运行环境已整理完成")
+        if profile_dir:
+            if keep_temp:
+                emit_progress(progress, f"保留诊断目录：{temp_dir}")
+                emit_progress(progress, f"保留运行目录：{profile_dir}")
+            else:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                shutil.rmtree(profile_dir, ignore_errors=True)
+                emit_progress(progress, "运行环境已整理完成")
 
 
 def read_cookie(args):
