@@ -1151,17 +1151,16 @@ async def fetch_missing_readerinfo_resources(
         return False
 
     missing = missing_pages()
-    if any(index <= 2 for index in missing):
-        await fetch_and_merge(1, 2)
-
-    missing = [index for index in missing_pages() if index >= 3]
     while missing:
-        start_page = min(missing)
-        page_window = min(READERINFO_PAGE_WINDOW, page_count - start_page + 1)
+        # getdocreader2019 behaves like "return the first rn pages" for many
+        # html_view docs, even when pn is set to a later page. Prefix refetching
+        # fills tail gaps that window-style pn/rn requests cannot reach.
+        start_page = 1
+        page_window = min(READERINFO_PAGE_WINDOW, max(missing))
         before = set(json_urls)
         if not await fetch_and_merge(start_page, page_window):
             break
-        missing = [index for index in missing_pages() if index >= 3]
+        missing = missing_pages()
         if set(json_urls) == before:
             break
 
@@ -1185,8 +1184,8 @@ async def fetch_missing_readerinfo_page_images(context, doc_id, page_count, sour
 
     missing = [index for index in range(1, page_count + 1) if index not in urls_by_page]
     while missing:
-        start_page = min(missing)
-        page_window = min(READERINFO_PAGE_WINDOW, page_count - start_page + 1)
+        start_page = 1
+        page_window = min(READERINFO_PAGE_WINDOW, max(missing))
         before = set(urls_by_page)
         if not await fetch_and_merge(start_page, page_window):
             break

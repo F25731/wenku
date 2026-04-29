@@ -4,6 +4,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
+import wenku_to_pdf
 from structured_json_pdf import choose_pdf_font_for_text, normalize_text_for_pdf
 from wenku_to_pdf import (
     PdfDirectImageNotUsable,
@@ -433,6 +434,53 @@ class StructuredResourceTest(unittest.TestCase):
 
         self.assertEqual(urls_by_page[21], "https://wkretype.bdimg.com/retype/zoom/store?pn=21&o=jpg_6")
         self.assertEqual(urls_by_page[22], "https://wkretype.bdimg.com/retype/zoom/store?pn=22&o=jpg_6")
+
+
+class ReaderInfoFetchTest(unittest.IsolatedAsyncioTestCase):
+    async def test_public_readerinfo_refetches_prefix_to_cover_missing_tail_pages(self):
+        calls = []
+        original_fetch_public = wenku_to_pdf.fetch_public_readerinfo_payload
+        original_fetch_acs = wenku_to_pdf.fetch_readerinfo_payload
+
+        async def fake_public(context, doc_id, start_page, page_window, source_url):
+            calls.append((start_page, page_window))
+            return {
+                "data": {
+                    "storeId": "store123",
+                    "htmlUrls": {
+                        "json": [
+                            {"pageIndex": index, "pageLoadUrl": f"https://example.test/{index}.json"}
+                            for index in range(1, page_window + 1)
+                        ],
+                        "png": [],
+                        "ttf": [],
+                    },
+                }
+            }
+
+        async def fake_acs(*args, **kwargs):
+            raise AssertionError("ACS fallback should not run when public readerinfo succeeds")
+
+        wenku_to_pdf.fetch_public_readerinfo_payload = fake_public
+        wenku_to_pdf.fetch_readerinfo_payload = fake_acs
+        try:
+            json_urls = {1: "https://example.test/1.json", 2: "https://example.test/2.json"}
+            await wenku_to_pdf.fetch_missing_readerinfo_resources(
+                context=None,
+                doc_id="doc123",
+                page_count=12,
+                source_url="https://wenku.baidu.com/view/doc123.html",
+                json_urls=json_urls,
+                png_urls={},
+                font_urls={},
+                readerinfo_auth={},
+            )
+        finally:
+            wenku_to_pdf.fetch_public_readerinfo_payload = original_fetch_public
+            wenku_to_pdf.fetch_readerinfo_payload = original_fetch_acs
+
+        self.assertIn((1, 12), calls)
+        self.assertTrue(all(index in json_urls for index in range(1, 13)))
 
 
 if __name__ == "__main__":
