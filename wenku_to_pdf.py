@@ -43,6 +43,9 @@ READERINFO_TOKEN_TIMEOUT_SECONDS = float(os.environ.get("WENKU_READERINFO_TOKEN_
 HTTP_ONLY_ATTEMPTS = int(os.environ.get("WENKU_HTTP_ONLY_ATTEMPTS", "2"))
 DIRECT_STRUCTURED_TYPES = {"word", "doc", "docx", "pdf"}
 DIRECT_STRUCTURED_FALLBACK_TYPES = {"", "0", "txt", "html"}
+HTTP_STRUCTURED_TYPES = DIRECT_STRUCTURED_TYPES | DIRECT_STRUCTURED_FALLBACK_TYPES | {"excel", "xls", "xlsx"}
+PRESENTATION_TYPES = {"ppt", "pptx"}
+SPREADSHEET_TYPES = {"excel", "xls", "xlsx"}
 HTTP_USER_AGENT = os.environ.get(
     "WENKU_HTTP_USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -53,6 +56,8 @@ DOCINFO_TYPE_MAP = {
     "2": "excel",
     "3": "ppt",
     "4": "pdf",
+    "5": "excel",
+    "6": "ppt",
 }
 READER_OVERLAY_HIDE_CSS = """
 .tool-bar-wrap,
@@ -2061,6 +2066,21 @@ def can_try_direct_structured_document(document):
     return file_type in DIRECT_STRUCTURED_TYPES | DIRECT_STRUCTURED_FALLBACK_TYPES
 
 
+def can_try_http_structured_document(document):
+    if not document.get("docinfo") or not document.get("page_count"):
+        return False
+    file_type = document.get("file_type") or ""
+    return file_type in HTTP_STRUCTURED_TYPES
+
+
+def is_presentation_document(document):
+    return (document.get("file_type") or "") in PRESENTATION_TYPES or document.get("tpl_key") == "new_view"
+
+
+def is_spreadsheet_document(document):
+    return (document.get("file_type") or "") in SPREADSHEET_TYPES
+
+
 async def try_direct_structured_document(browser_context, page, temp_dir, output_pdf, document, url, progress=None):
     if not can_try_direct_structured_document(document):
         return None
@@ -2084,6 +2104,125 @@ async def try_direct_structured_document(browser_context, page, temp_dir, output
         return None
 
 
+async def process_http_structured_document(context, document, temp_dir, output_pdf, url, progress=None):
+    if not can_try_http_structured_document(document):
+        raise StructuredResourceNotUsable("当前文档类型不适合结构化 HTTP 处理")
+    return await process_structured_document(
+        context,
+        None,
+        document["page_count"],
+        temp_dir,
+        output_pdf,
+        {},
+        document["file_type"],
+        progress=progress,
+        source_url=url,
+        docinfo=document["docinfo"],
+        direct=True,
+        allow_page_fallback=False,
+    )
+
+
+async def process_http_presentation_document(context, doc_id, page_count, temp_dir, output_pdf, source_url, progress=None):
+    return await process_http_page_image_document(
+        context,
+        doc_id,
+        page_count,
+        temp_dir,
+        output_pdf,
+        source_url,
+        progress=progress,
+        prepare_message="正在准备演示文档页面",
+        ready_message="页面准备完成",
+        mode="ppt-page-images-http",
+        extension=".jpg",
+    )
+
+
+async def process_http_page_image_document(
+    context,
+    doc_id,
+    page_count,
+    temp_dir,
+    output_pdf,
+    source_url,
+    progress=None,
+    prepare_message="正在准备文档页面",
+    ready_message="页面准备完成",
+    mode="page-images-http",
+    extension=".png",
+    image_validator=None,
+    flatten=False,
+):
+    urls_by_page = {}
+    emit_progress(progress, prepare_message)
+    await fetch_missing_readerinfo_page_images(context, doc_id, page_count, source_url, urls_by_page, {})
+
+    missing = [index for index in range(1, page_count + 1) if index not in urls_by_page]
+    if missing:
+        raise StructuredResourceNotUsable(f"页面资源不完整，缺少页面：{missing[:10]}")
+
+    emit_progress(progress, f"{ready_message}，共 {page_count} 页")
+    image_paths = []
+    for index in range(1, page_count + 1):
+        path = temp_dir / f"{index:04d}{extension}"
+        await download_binary(context, urls_by_page[index], path, source_url)
+        try:
+            with Image.open(path) as image:
+                image.verify()
+        except Exception as exc:
+            raise StructuredResourceNotUsable(f"页面图片异常：第 {index} 页") from exc
+        if image_validator and not image_validator(path):
+            raise StructuredResourceNotUsable(f"页面图片不完整：第 {index} 页")
+        if flatten:
+            flatten_image_on_white(path)
+        image_paths.append(path)
+        emit_progress(progress, f"处理第 {index}/{page_count} 页 ✅")
+
+    emit_progress(progress, "页面处理完成，正在生成最终文件")
+    write_pdf_from_images(image_paths, output_pdf)
+    return {"mode": mode, "pages": page_count}
+
+
+async def process_http_spreadsheet_document(context, document, temp_dir, output_pdf, url, progress=None):
+    try:
+        return await process_http_structured_document(context, document, temp_dir, output_pdf, url, progress=progress)
+    except StructuredResourceNotUsable:
+        doc_id = doc_id_from_data_or_url(document.get("data") or {}, url)
+        return await process_http_page_image_document(
+            context,
+            doc_id,
+            document["page_count"],
+            temp_dir,
+            output_pdf,
+            url,
+            progress=progress,
+            prepare_message="正在准备表格文档页面",
+            ready_message="页面校验完成",
+            mode="excel-page-images-http",
+            extension=".png",
+            image_validator=excel_direct_image_looks_complete,
+            flatten=True,
+        )
+
+
+async def process_http_document_by_type(context, document, temp_dir, output_pdf, url, progress=None):
+    doc_id = doc_id_from_data_or_url(document.get("data") or {}, url)
+    if is_presentation_document(document):
+        return await process_http_presentation_document(
+            context,
+            doc_id,
+            document["page_count"],
+            temp_dir,
+            output_pdf,
+            url,
+            progress=progress,
+        )
+    if is_spreadsheet_document(document):
+        return await process_http_spreadsheet_document(context, document, temp_dir, output_pdf, url, progress=progress)
+    return await process_http_structured_document(context, document, temp_dir, output_pdf, url, progress=progress)
+
+
 async def try_convert_http_only(url, cookie_text, temp_dir, output_dir, progress=None):
     context = HttpContextAdapter(cookie_text)
     doc_id = doc_id_from_data_or_url({}, url)
@@ -2102,27 +2241,12 @@ async def try_convert_http_only(url, cookie_text, temp_dir, output_dir, progress
         "tpl_key": "",
         "page_count": page_count,
     }
-    if not can_try_direct_structured_document(document):
-        raise StructuredResourceNotUsable("当前文档类型需要备用处理方案")
 
     output_pdf = output_dir / f"{title}.pdf"
     emit_progress(progress, f"文档名称：{title}")
     emit_progress(progress, f"文档页数：{page_count or 'unknown'}")
     emit_progress(progress, "已选择最佳处理方案")
-    result = await process_structured_document(
-        context,
-        None,
-        page_count,
-        temp_dir,
-        output_pdf,
-        {},
-        file_type,
-        progress=progress,
-        source_url=url,
-        docinfo=docinfo,
-        direct=True,
-        allow_page_fallback=False,
-    )
+    result = await process_http_document_by_type(context, document, temp_dir, output_pdf, url, progress=progress)
     emit_progress(progress, f"最终文件已生成：{output_pdf.name}")
     return {"output": str(output_pdf), **result}
 

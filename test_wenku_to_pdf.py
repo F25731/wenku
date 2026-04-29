@@ -88,6 +88,96 @@ class ImageBlankDetectionTest(unittest.TestCase):
 
 
 class ConvertHttpFirstTest(unittest.IsolatedAsyncioTestCase):
+    def test_docinfo_type_6_is_treated_as_ppt(self):
+        docinfo = {
+            "docInfo": {
+                "docTitle": "demo",
+                "docType": "6",
+                "totalPageNum": "32",
+            }
+        }
+
+        self.assertEqual(wenku_to_pdf.docinfo_document_info(docinfo), ("demo", "ppt", 32))
+
+    def test_docinfo_type_5_is_treated_as_excel(self):
+        docinfo = {
+            "docInfo": {
+                "docTitle": "demo",
+                "docType": "5",
+                "totalPageNum": "1",
+            }
+        }
+
+        self.assertEqual(wenku_to_pdf.docinfo_document_info(docinfo), ("demo", "excel", 1))
+
+    async def test_http_pipeline_dispatches_xlsx_to_spreadsheet_handler(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_pdf = Path(temp_dir) / "sheet.pdf"
+            document = {
+                "file_type": "excel",
+                "page_count": 2,
+                "title": "sheet",
+                "docinfo": {"docInfo": {"docTitle": "sheet"}},
+                "data": None,
+            }
+            calls = {}
+
+            async def fake_spreadsheet_handler(context, document, temp_dir, output_pdf, source_url, progress=None):
+                calls["args"] = (document["file_type"], document["page_count"], output_pdf.name, source_url)
+                output_pdf.write_bytes(b"%PDF-1.4\n% demo\n")
+                return {"mode": "spreadsheet-http", "pages": document["page_count"]}
+
+            original_handler = wenku_to_pdf.process_http_spreadsheet_document
+            try:
+                wenku_to_pdf.process_http_spreadsheet_document = fake_spreadsheet_handler
+
+                result = await wenku_to_pdf.process_http_document_by_type(
+                    object(),
+                    document,
+                    Path(temp_dir),
+                    output_pdf,
+                    "https://wenku.baidu.com/view/sheet.html",
+                )
+
+                self.assertEqual(result["mode"], "spreadsheet-http")
+                self.assertEqual(calls["args"], ("excel", 2, "sheet.pdf", "https://wenku.baidu.com/view/sheet.html"))
+            finally:
+                wenku_to_pdf.process_http_spreadsheet_document = original_handler
+
+    async def test_http_pipeline_dispatches_ppt_to_page_image_handler(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_pdf = Path(temp_dir) / "demo.pdf"
+            document = {
+                "file_type": "ppt",
+                "page_count": 3,
+                "title": "demo",
+                "docinfo": {"docInfo": {"docTitle": "demo"}},
+                "data": None,
+            }
+            calls = {}
+
+            async def fake_ppt_handler(context, doc_id, page_count, temp_dir, output_pdf, source_url, progress=None):
+                calls["args"] = (doc_id, page_count, output_pdf.name, source_url)
+                output_pdf.write_bytes(b"%PDF-1.4\n% demo\n")
+                return {"mode": "ppt-page-images-http", "pages": page_count}
+
+            original_handler = wenku_to_pdf.process_http_presentation_document
+            try:
+                wenku_to_pdf.process_http_presentation_document = fake_ppt_handler
+
+                result = await wenku_to_pdf.process_http_document_by_type(
+                    object(),
+                    document,
+                    Path(temp_dir),
+                    output_pdf,
+                    "https://wenku.baidu.com/view/demo.html",
+                )
+
+                self.assertEqual(result["mode"], "ppt-page-images-http")
+                self.assertEqual(calls["args"], ("demo", 3, "demo.pdf", "https://wenku.baidu.com/view/demo.html"))
+            finally:
+                wenku_to_pdf.process_http_presentation_document = original_handler
+
     async def test_convert_returns_http_result_without_starting_playwright(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir) / "out"
