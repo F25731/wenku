@@ -415,6 +415,10 @@ class StructuredResourceTest(unittest.TestCase):
         self.assertEqual(choose_pdf_font_for_text("·", default_font="STSong-Light"), "Helvetica")
         self.assertEqual(choose_pdf_font_for_text("正文", default_font="STSong-Light"), "STSong-Light")
 
+    def test_uses_ipa_capable_font_for_phonetic_symbols(self):
+        self.assertEqual(choose_pdf_font_for_text("/hə'ləʊ/", default_font="STSong-Light"), "IpaLatin")
+        self.assertEqual(choose_pdf_font_for_text("/bi;biː/", default_font="STSong-Light"), "IpaLatin")
+
     def test_merges_readerinfo_html_urls_by_page_index(self):
         json_urls = {}
         png_urls = {}

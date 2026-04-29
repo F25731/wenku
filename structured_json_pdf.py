@@ -1,5 +1,6 @@
 import json
 import os
+import reportlab
 from importlib import reload
 from pathlib import Path
 
@@ -8,6 +9,9 @@ from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
+
+
+IPA_FONT_NAME = "IpaLatin"
 
 
 def _page_styles(data):
@@ -31,10 +35,46 @@ def normalize_text_for_pdf(text, default_font=None):
     return text
 
 
+def has_ipa_text(text):
+    ipa_chars = set("æðŋɑɒɔəɜɡɪʃʊʌʒθː")
+    for char in text or "":
+        codepoint = ord(char)
+        if char in ipa_chars:
+            return True
+        if 0x0250 <= codepoint <= 0x02FF:
+            return True
+        if 0x1D00 <= codepoint <= 0x1D7F:
+            return True
+    return False
+
+
 def choose_pdf_font_for_text(text, default_font=None):
     if default_font and text.strip() in {"•", "·"}:
         return "Helvetica"
+    if default_font and has_ipa_text(text):
+        return IPA_FONT_NAME
     return default_font
+
+
+def _ipa_font_candidates():
+    configured = os.environ.get("WENKU_IPA_FONT_PATH", "").strip()
+    if configured:
+        yield Path(configured)
+    yield Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+    yield Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf")
+    yield Path("C:/Windows/Fonts/arial.ttf")
+    yield Path(reportlab.__file__).parent / "fonts" / "Vera.ttf"
+
+
+def _register_ipa_font():
+    font_path = next((path for path in _ipa_font_candidates() if path.exists()), None)
+    if not font_path:
+        return False
+    try:
+        pdfmetrics.registerFont(TTFont(IPA_FONT_NAME, str(font_path)))
+        return True
+    except Exception:
+        return False
 
 
 def _register_page_fonts(temp_dir, pagenum):
@@ -67,6 +107,7 @@ def save_structured_page_pdf(temp_dir, pagenum, font_replace=None, default_font=
             pdfmetrics.registerFont(UnicodeCIDFont(default_font))
         except Exception:
             pass
+        _register_ipa_font()
         page_fonts = [default_font]
     else:
         page_fonts = _register_page_fonts(temp_dir, pagenum)

@@ -14,7 +14,10 @@ COPY requirements_wenku_to_pdf.txt /app/requirements.txt
 
 RUN python -m pip install --upgrade pip \
     && python -m pip install -r /app/requirements.txt \
-    && python -m playwright install --with-deps chromium
+    && python -m playwright install --with-deps chromium \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY . /app
 
